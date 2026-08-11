@@ -3,6 +3,12 @@ import sys
 import gc
 import asyncio
 import logging
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
