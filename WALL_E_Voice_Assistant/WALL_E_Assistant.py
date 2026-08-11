@@ -47,9 +47,8 @@ from tools import (
 # =========================
 class WalleRealtimeAgent(Agent):
     def __init__(self) -> None:
-        # All WALL-E active tools
+        # All WALL-E active function tools
         self._tools_list = [
-            send_uart_command,
             see_object,
             move_robot,
             get_weather,
