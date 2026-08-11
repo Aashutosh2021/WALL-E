@@ -197,7 +197,16 @@ BAUD_RATE=115200
 ### 4. Flash ESP32 Firmware
 Open `WALL_E_ESP32/WALL_E_ESP32.ino` in Arduino IDE, select **ESP32 Dev Module**, install `Adafruit_SSD1306` and `Adafruit_GFX` libraries, and upload to the ESP32 board.
 
-### 5. Launch WALL-E Robot (Headless Terminal Mode)
+### 5. Launch WALL-E Robot
+
+#### Option A: Direct Gemini Live WebSocket (Ultra-low ~300ms Latency, 30MB RAM)
+```bash
+cd ~/WALL-E/WALL_E_Voice_Assistant
+source .venv/bin/activate
+python main.py
+```
+
+#### Option B: LiveKit Cloud Room Worker
 ```bash
 cd ~/WALL-E/WALL_E_Voice_Assistant
 source .venv/bin/activate
