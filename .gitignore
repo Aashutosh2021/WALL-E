@@ -1,0 +1,20 @@
+# Python cache & compiled files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables & Credentials
+.env
+*.env
+firebase_cred.json
+voice.json
+firebase_auth.py
+
+# Memory & database files
+mark_memory/
+*.db
