@@ -19,8 +19,27 @@ SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
 BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
+def _probe_uart() -> bool:
+    """Check once at startup if UART serial port is accessible."""
+    try:
+        import serial
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.5):
+            pass
+        logger.info(f"UART Serial Port ({SERIAL_PORT}) detected. Eye animations enabled.")
+        return True
+    except Exception:
+        logger.info(f"UART Serial Port ({SERIAL_PORT}) not available (Windows/dev mode). Eye animations disabled.")
+        return False
+
+# Probe once — no repeated warnings during runtime
+_UART_AVAILABLE: bool = _probe_uart()
+
 def send_uart_command(command: str) -> bool:
-    """Send command over UART hardware serial to ESP32."""
+    """Send command over UART hardware serial to ESP32.
+    Silently skips if UART is not available (e.g. running on Windows).
+    """
+    if not _UART_AVAILABLE:
+        return False  # silently ignore — no spam
     formatted_cmd = f"{command.strip().upper()}\n"
     try:
         import serial
@@ -29,7 +48,7 @@ def send_uart_command(command: str) -> bool:
             logger.info(f"UART Sent: {formatted_cmd.strip()}")
             return True
     except Exception as e:
-        logger.warning(f"UART Serial Port ({SERIAL_PORT}) not available or failed: {e}. Simulating command: {formatted_cmd.strip()}")
+        logger.debug(f"UART write failed: {e}")
         return False
 
 
