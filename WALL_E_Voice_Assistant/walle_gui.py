@@ -86,7 +86,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from Mark_Voice_Assistant import Assistant, entrypoint
+from WALL_E_Assistant import Assistant, entrypoint
 import traceback
 
 # Conditional imports for face recognition
@@ -221,7 +221,7 @@ class RightPanel(QWidget):
         )
         layout.addWidget(network_label)
         self.network_status_widget = self.create_network_card(
-            "CONNECTION", "WiFi (MARK_5G) - 92%"
+            "CONNECTION", "WiFi (WALL_E_5G) - 92%"
         )
         layout.addWidget(self.network_status_widget)
 
@@ -893,11 +893,11 @@ class TemperatureBar(LinearProgressBar):
 
 
 
-class MARKInterfaceWidget(QWidget):
-    """Futuristic MARK token display - four circular letter tokens with pulsing animations."""
+class WALLEInterfaceWidget(QWidget):
+    """Futuristic WALL-E token display - circular letter tokens with pulsing animations."""
 
     class Token:
-        """Data class for each MARK letter token."""
+        """Data class for each WALL-E letter token."""
         def __init__(self, letter, index):
             self.letter = letter
             self.index = index
@@ -913,12 +913,13 @@ class MARKInterfaceWidget(QWidget):
         self.setStyleSheet("background-color: transparent;")
         self.setMouseTracking(True)
 
-        # Create four tokens for M, A, R, K
+        # Create tokens for W, A, L, L, E
         self.tokens = [
-            self.Token('M', 0),
+            self.Token('W', 0),
             self.Token('A', 1),
-            self.Token('R', 2),
-            self.Token('K', 3),
+            self.Token('L', 2),
+            self.Token('L', 3),
+            self.Token('E', 4),
         ]
 
         # Animation state
@@ -1027,7 +1028,7 @@ class MARKInterfaceWidget(QWidget):
         p.fillRect(self.rect(), gradient)
 
     def _draw_token(self, p, token):
-        """Draw a single MARK token with outer ring, pulsing inner ring, and letter."""
+        """Draw a single WALL-E token with outer ring, pulsing inner ring, and letter."""
         center = token.center
         base_r = token.base_radius
         
@@ -1102,14 +1103,14 @@ class MARKInterfaceWidget(QWidget):
         
         p.end()
 
-class MARKInterfaceWindow(QMainWindow):
-    """Main window for MARK AI Interface."""
+class WALLEInterfaceWindow(QMainWindow):
+    """Main window for WALL-E AI Companion Robot Interface."""
 
     def __init__(self):
         super().__init__()
         self.agent_process = None
-        self.setWindowIcon(QIcon(resource_path("Mark_logo.png")))
-        self.setWindowTitle(f"MARK AI - {VARIANT_NAME.upper()} Edition")
+        self.setWindowIcon(QIcon(resource_path("WALL_E_logo.png")))
+        self.setWindowTitle(f"WALL-E AI Companion Robot - {VARIANT_NAME.upper()} Edition")
         self.setGeometry(100, 100, 1600, 900)
         self.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0a0510, stop:0.5 #150a20, stop:1 #0a0510);")
 
@@ -1121,11 +1122,11 @@ class MARKInterfaceWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         self.left_panel = SystemStatsPanel()
-        self.MARK_widget = MARKInterfaceWidget()
+        self.WALLE_widget = WALLEInterfaceWidget()
         self.right_panel = RightPanel()
 
         main_layout.addWidget(self.left_panel)
-        main_layout.addWidget(self.MARK_widget, 1) # Central widget takes extra space
+        main_layout.addWidget(self.WALLE_widget, 1) # Central widget takes extra space
         main_layout.addWidget(self.right_panel)
 
         self.assistant = None
@@ -1244,7 +1245,7 @@ class MARKInterfaceWindow(QMainWindow):
         self.update_mic_button_style()
         
         # Trigger visual feedback
-        self.MARK_widget.trigger_special_effect()
+        self.WALLE_widget.trigger_special_effect()
         
         # Control Windows system microphone
         if self.mic_muted:
@@ -1318,28 +1319,28 @@ class MARKInterfaceWindow(QMainWindow):
 
     def get_effect_callback(self):
         """Return the effect function for external TTS use."""
-        return self.MARK_widget.trigger_special_effect
+        return self.WALLE_widget.trigger_special_effect
 
     def _start_agent_background(self):
-            """Start LiveKit worker (MARK_Voice_Assistant) in a separate process"""
+            """Start LiveKit worker (WALL_E_Assistant) in a separate process"""
 
             def run_agent():
                 try:
-                    print("🟡 Starting MARK LiveKit worker process...")
+                    print("🟡 Starting WALL-E LiveKit worker process...")
                     
                     # Store event loop for mic control
                     self.agent_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(self.agent_loop)
 
-                    # Same venv ka Python use hoga
+                    assistant_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "WALL_E_Assistant.py")
                     cmd = [
                         sys.executable,
-                        "E:\\Nova\\MARK\\Mark_Voice_Assisstant\\Mark_Voice_Assistant.py",
-                        "console",      # <- yeh arg LiveKit CLI ke liye hai
+                        assistant_script,
+                        "console",      # <- arg for LiveKit CLI
                     ]
                     self.agent_process = subprocess.Popen(cmd)
 
-                    print("✅ MARK worker process started.")
+                    print("✅ WALL-E worker process started.")
                 except Exception as e:
                     print(f"❌ Agent process error: {e}")
                     traceback.print_exc()
@@ -1363,7 +1364,7 @@ class MARKInterfaceWindow(QMainWindow):
         """Stops the background agent process if it was started."""
         if self.agent_process:
             try:
-                print("🛑 Terminating MARK worker process...")
+                print("🛑 Terminating WALL-E worker process...")
                 self.agent_process.terminate()   # send SIGTERM
                 self.agent_process.wait(timeout=5)
                 print("✅ Worker terminated.")
@@ -1421,7 +1422,7 @@ def wait_for_internet():
         msg_box = QMessageBox()
         msg_box.setIcon(QMessageBox.Critical)
         msg_box.setText("Network Error")
-        msg_box.setInformativeText("MARK requires an internet connection to start.")
+        msg_box.setInformativeText("WALL-E requires an internet connection to start.")
         msg_box.setWindowTitle("Connection Error")
         msg_box.exec_()
         return False
@@ -1467,22 +1468,22 @@ def prompt_access_key():
     """Prompt user for access key"""
     try:
         from PyQt5.QtWidgets import QInputDialog
-        text, ok = QInputDialog.getText(None, 'Access Key Required', 'Enter your MARK access key:')
+        text, ok = QInputDialog.getText(None, 'Access Key Required', 'Enter your WALL-E access key:')
         return text.strip() if ok and text.strip() else None
     except:
         # Fallback to console input if no QApplication
         import getpass
-        return input("Enter your MARK access key: ").strip()
+        return input("Enter your WALL-E access key: ").strip()
 
 def prompt_user_name():
     """Prompt user for their name"""
     try:
         from PyQt5.QtWidgets import QInputDialog
-        text, ok = QInputDialog.getText(None, 'User Name Setup', 'What should MARK call you?\n(This will be used for personalized interactions):')
+        text, ok = QInputDialog.getText(None, 'User Name Setup', 'What should WALL-E call you?\n(This will be used for personalized interactions):')
         return text.strip() if ok and text.strip() else None
     except:
         # Fallback to console input if no QApplication
-        return input("What should MARK call you? ").strip()
+        return input("What should WALL-E call you? ").strip()
 
 def check_and_setup_user_name():
     """Check if user name is set, if not prompt for it"""
@@ -1516,8 +1517,8 @@ def main():
     """Main entry point for the application."""
     load_dotenv()
     os.environ['IS_ACTIVATED'] = 'true'
-    if not os.getenv('MARK_VARIANT'):
-        os.environ['MARK_VARIANT'] = 'ultra'
+    if not os.getenv('WALLE_VARIANT'):
+        os.environ['WALLE_VARIANT'] = 'ultra'
 
     if len(sys.argv) > 1 and sys.argv[1].lower() == "console":
         agents_cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
@@ -1536,8 +1537,8 @@ def main():
     # Setup user profile if needed
     check_and_setup_user_name()
 
-    print("🚀 Starting MARK Voice Assistant...")
-    window = MARKInterfaceWindow()
+    print("🚀 Starting WALL-E AI Companion Robot...")
+    window = WALLEInterfaceWindow()
     window.show()
     sys.exit(app.exec_())
 

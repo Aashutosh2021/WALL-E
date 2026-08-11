@@ -135,9 +135,9 @@ sequenceDiagram
 
 ```
 WALL-E/
-├── Mark_Voice_Assisstant/
+├── WALL_E_Voice_Assistant/
 │   ├── WALL_E_Assistant.py       # Core LiveKit + Gemini 2.5 Flash Agent & Hardware Eye Sync
-│   ├── Mark_Voice_Assistant.py   # Re-exporter for backward compatibility
+│   ├── walle_gui.py              # Graphical User Interface
 │   ├── tools.py                  # RAM-optimized tools (move_robot, see_object, weather, search)
 │   ├── prompts.py                # System instructions & WALL-E robot identity specifications
 │   ├── .env                      # Environment configuration & API keys
@@ -167,7 +167,7 @@ sudo raspi-config
 ```bash
 cd ~
 git clone https://github.com/Aashutosh2021/WALL-E.git
-cd WALL-E/Mark_Voice_Assisstant
+cd WALL-E/WALL_E_Voice_Assistant
 
 # Create Python virtual environment
 python3 -m venv .venv
@@ -178,16 +178,16 @@ pip install livekit-agents livekit-plugins-google livekit-plugins-noise-cancella
 ```
 
 ### 3. Configure Environment (`.env`)
-Create or edit `.env` inside `Mark_Voice_Assisstant/`:
+Create or edit `.env` inside `WALL_E_Voice_Assistant/`:
 ```env
-LIVEKIT_URL=wss://jarvis-9ngf0fxj.livekit.cloud
+LIVEKIT_URL=wss://xxxxx-xxxxxxx.livekit.cloud
 LIVEKIT_API_KEY=YOUR_LIVEKIT_KEY
 LIVEKIT_API_SECRET=YOUR_LIVEKIT_SECRET
 
 GOOGLE_API_KEY=YOUR_GOOGLE_API_KEY
 ROBOT_NAME='WALL-E'
 USER_NAME='Aashutosh'
-MARK_VARIANT='ultra'
+WALLE_VARIANT='ultra'
 LAN=Hindi
 LOG_LEVEL=INFO
 SERIAL_PORT='/dev/serial0'
@@ -199,7 +199,7 @@ Open `WALL_E_ESP32/WALL_E_ESP32.ino` in Arduino IDE, select **ESP32 Dev Module**
 
 ### 5. Launch WALL-E Robot
 ```bash
-cd ~/WALL-E/Mark_Voice_Assisstant
+cd ~/WALL-E/WALL_E_Voice_Assistant
 source .venv/bin/activate
 python WALL_E_Assistant.py dev
 ```

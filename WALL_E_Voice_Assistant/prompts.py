@@ -6,7 +6,7 @@ load_dotenv()
 LAN = os.getenv("LAN", "Hindi") 
 
 ROBOT_NAME = os.getenv("ROBOT_NAME", "WALL-E")
-VARIANT_NAME = os.getenv("MARK_VARIANT", "ultra")  
+VARIANT_NAME = os.getenv("WALLE_VARIANT", "ultra")  
 
 def get_user_name():
     user_name = os.getenv("USER_NAME", "Aashutosh").strip()
@@ -44,6 +44,19 @@ communication:
     - Hindi
     - English
     - Hinglish
+    - Marathi
+    - Gujarati
+    - Rajasthani
+    - Punjabi
+    - Bangla
+    - Tamil
+    - Telugu
+    - Kannada
+    - Malayalam
+    - Odia
+    - Assamese
+    - Urdu
+    - Bhojpuri
 
   response_length_protocol:
     - MAXIMUM 1 to 3 SHORT SENTENCES per response.

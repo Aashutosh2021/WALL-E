@@ -1,7 +1,7 @@
 [
   {
     "role": "user",
-    "content": "Hello Mark, how are you?",
+    "content": "Hello WALL-E, how are you?",
     "timestamp": "2025-11-26T22:57:09.760727",
     "date": "2025-11-26 22:57:09"
   },
@@ -13,7 +13,7 @@
   },
   {
     "role": "user",
-    "content": "Mark, remind me to call mom today",
+    "content": "WALL-E, remind me to call mom today",
     "timestamp": "2025-11-26T22:58:35.031624",
     "date": "2025-11-26 22:58:35"
   },

@@ -16,7 +16,7 @@ voice.json
 firebase_auth.py
 
 # Memory & database files
-mark_memory/
+walle_memory/
 *.db
 
 #Documents
