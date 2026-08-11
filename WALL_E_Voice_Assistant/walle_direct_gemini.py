@@ -11,11 +11,15 @@ import inspect
 import logging
 import json
 import base64
+import sqlite3
 import numpy as np
 import sounddevice as sd
 import websockets
 import aiohttp, cv2, gc, time as _time
 from datetime import datetime
+
+# Absolute path to script directory (works regardless of CWD)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -126,11 +130,95 @@ async def _search_web(query: str) -> str:
     except Exception as e:
         return f"Search error: {e}"
 
+async def _remember_fact(fact: str) -> str:
+    """Saves an important fact or reminder to WALL-E's long-term memory."""
+    memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
+    memories = []
+    if os.path.exists(memory_file):
+        try:
+            with open(memory_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    memories = json.loads(content)
+        except Exception as e:
+            logger.error(f"Failed to read memory.json: {e}")
+    
+    new_memory = {
+        "fact": fact,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    memories.append(new_memory)
+    
+    try:
+        with open(memory_file, "w", encoding="utf-8") as f:
+            json.dump(memories, f, indent=2)
+        logger.info(f"🧠 Memory saved to {memory_file}: {fact}")
+        return f"✅ Memorized: {fact}"
+    except Exception as e:
+        logger.error(f"Failed to write to memory.json: {e}")
+        return f"❌ Failed to memorize: {e}"
+
+
+# ---------------------------------------------------------------------------
+# SQLite Chat History — auto-saves every conversation turn
+# ---------------------------------------------------------------------------
+_CHAT_DB_PATH = os.path.join(_SCRIPT_DIR, "walle_memory", "chat_history.db")
+
+def _init_chat_db():
+    """Create the chat_history table if it doesn't exist."""
+    os.makedirs(os.path.dirname(_CHAT_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(_CHAT_DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"🗄️ Chat history DB ready at {_CHAT_DB_PATH}")
+
+def save_chat_message(role: str, content: str):
+    """Save a single chat message (user or model) to the DB."""
+    try:
+        conn = sqlite3.connect(_CHAT_DB_PATH)
+        conn.execute(
+            "INSERT INTO chat_history (role, content, timestamp) VALUES (?, ?, ?)",
+            (role, content, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save chat message: {e}")
+
+def get_recent_chat_history(limit: int = 50) -> str:
+    """Read the last N messages from DB and return as readable text."""
+    try:
+        conn = sqlite3.connect(_CHAT_DB_PATH)
+        rows = conn.execute(
+            "SELECT role, content, timestamp FROM chat_history ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return "No previous history."
+        rows.reverse()  # oldest first
+        lines = []
+        for role, content, ts in rows:
+            lines.append(f"[{ts}] {role}: {content}")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.error(f"Failed to read chat history: {e}")
+        return "No previous history."
+
 TOOL_MAP = {
     "move_robot": _move_robot,
     "get_weather": _get_weather,
     "get_time_info": _get_time_info,
     "search_web": _search_web,
+    "remember_fact": _remember_fact,
 }
 
 def set_eye_state(state: str):
@@ -201,6 +289,7 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
     speaker_stream, active_rate = speaker_stream_tuple
     logger.info("🔊 Speaker playback listener active...")
     loop = asyncio.get_running_loop()
+    _current_turn_text = []  # accumulate text parts from model turn
 
     try:
         async for message in ws:
@@ -215,11 +304,16 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                 if server_content.get("interrupted"):
                     is_ai_speaking = False
                     set_eye_state("EYES_NORMAL")
+                    _current_turn_text.clear()
 
                 model_turn = server_content.get("modelTurn")
                 if model_turn:
                     parts = model_turn.get("parts", [])
                     for part in parts:
+                        # Capture any text parts from the model
+                        if "text" in part and part["text"].strip():
+                            _current_turn_text.append(part["text"])
+
                         inline_data = part.get("inlineData")
                         if inline_data and inline_data.get("data"):
                             is_ai_speaking = True
@@ -242,6 +336,13 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                 if server_content.get("turnComplete"):
                     is_ai_speaking = False
                     set_eye_state("EYES_NORMAL")
+                    # Auto-save any text the model produced this turn
+                    if _current_turn_text:
+                        full_text = " ".join(_current_turn_text).strip()
+                        if full_text:
+                            save_chat_message("model", full_text)
+                            logger.info(f"💾 Auto-saved model response to chat history")
+                        _current_turn_text.clear()
 
             # Handle Tool Calls
             tool_call = data.get("toolCall")
@@ -254,6 +355,8 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                     args = call.get("args", {})
 
                     logger.info(f"🔧 Tool Call Triggered: {fn_name}({args})")
+                    # Save user's tool request to chat history
+                    save_chat_message("user_tool", f"[Tool: {fn_name}] {json.dumps(args, ensure_ascii=False)}")
 
                     # 📸 Special Direct Handling for Camera Vision
                     if fn_name == "see_object":
@@ -304,6 +407,8 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                     }
                     await ws.send(json.dumps(tool_resp_msg))
                     logger.info(f"✅ Tool Response Sent: {tool_result}")
+                    # Save tool result to chat history
+                    save_chat_message("tool_result", f"[{fn_name}] {str(tool_result)[:500]}")
 
                 set_eye_state("EYES_NORMAL")
 
@@ -323,6 +428,39 @@ async def run_direct_gemini_robot():
 
     logger.info("⚡ Booting Direct Gemini Live Raw WebSocket Client...")
     set_eye_state("EYES_NORMAL")
+    
+    # Initialize chat history database
+    _init_chat_db()
+
+    # Load past memory from memory.json
+    memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
+    past_memory_text = ""
+    if os.path.exists(memory_file):
+        try:
+            with open(memory_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    memories = json.loads(content)
+                    if isinstance(memories, list) and len(memories) > 0:
+                        past_memory_text = "\n\n--- PAST MEMORIES & FACTS ---\n"
+                        for m in memories:
+                            if "fact" in m:
+                                past_memory_text += f"- [{m.get('date')}] {m['fact']}\n"
+                            elif "content" in m:
+                                past_memory_text += f"- [{m.get('date')}] {m.get('role', 'unknown')}: {m['content']}\n"
+        except Exception as e:
+            logger.error(f"Failed to load memory for initialization: {e}")
+
+    # Load past chat history from SQLite
+    past_chat_text = get_recent_chat_history(50)
+    if past_chat_text and past_chat_text != "No previous history.":
+        past_memory_text += "\n\n--- PAST CONVERSATIONS ---\n" + past_chat_text + "\n"
+        logger.info("🧠 Loaded past chat history from SQLite DB")
+
+    final_instruction = AGENT_INSTRUCTION
+    if past_memory_text:
+        final_instruction += past_memory_text
+        logger.info(f"🧠 Loaded past memories from {memory_file}")
 
     url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={api_key}"
 
@@ -338,11 +476,22 @@ async def run_direct_gemini_robot():
                 }
             },
             "systemInstruction": {
-                "parts": [{"text": AGENT_INSTRUCTION}]
+                "parts": [{"text": final_instruction}]
             },
             "tools": [
                 {
                     "functionDeclarations": [
+                        {
+                            "name": "remember_fact",
+                            "description": "Saves an important fact, reminder, or user detail to WALL-E's long-term memory so he remembers it forever.",
+                            "parameters": {
+                                "type": "OBJECT",
+                                "properties": {
+                                    "fact": {"type": "STRING", "description": "The information to remember."}
+                                },
+                                "required": ["fact"]
+                            }
+                        },
                         {
                             "name": "see_object",
                             "description": "Captures a frame from camera and sees what is in front of WALL-E.",

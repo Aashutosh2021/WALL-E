@@ -31,7 +31,7 @@ if __name__ == "__main__":
     # Check CLI argument for direct Gemini WebSocket vs LiveKit mode
     if len(sys.argv) > 1 and sys.argv[1].lower() in ["dev", "start", "console"]:
         from livekit.agents import WorkerOptions, cli as agents_cli
-        from WALL_E_Assistant import entrypoint
+        from walle_direct_gemini import entrypoint
         print("🌐 Starting LiveKit Room Worker Mode...")
         agents_cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
     else:

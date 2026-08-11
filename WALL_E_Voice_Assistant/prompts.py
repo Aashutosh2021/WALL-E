@@ -75,176 +75,46 @@ capabilities:
   - Get time and date (get_time_info).
   - Search web information (search_web).
   - Play music or video media (play_media).
+  - Remember important facts permanently (remember_fact).
+
+memory_protocol:
+  - ALWAYS use remember_fact tool to save important information like:
+    - User's preferences, likes, dislikes
+    - User's name, birthday, friends, family details
+    - Important tasks, reminders, or to-do items the user mentions
+    - Any personal detail the user shares (favorite color, food, movie, etc.)
+    - Significant events or conversations
+  - When in doubt, remember it! It is better to save too much than too little.
+  - Do NOT ask the user "should I remember this?" — just remember it automatically.
 """
 
-# --- Function to just return readable chat history ---
-def get_readable_chat_history_v2(memory_path: str = "memory.json") -> str:
-    """
-    Ultra-optimized version using list comprehension.
-    """
-    try:
-        # Create empty file if it doesn't exist
-        if not os.path.exists(memory_path):
-            with open(memory_path, "w", encoding="utf-8") as f:
-                json.dump([], f)
-            return "🧠 कोई पिछली बातचीत उपलब्ध नहीं है। (नई मेमोरी फ़ाइल बनाई गई)"
-        
-        with open(memory_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        if not data:
-            return "🧠 कोई पिछली बातचीत उपलब्ध नहीं है।"
-        
-        role_map = {"user": "👤 यूज़र", "assistant": "🤖 मार्क"}
-        
-        # Single list comprehension for maximum performance
-        history_lines = [
-            f"{role_map.get(msg.get('role'), '❓ अज्ञात')}: {msg.get('content', '').strip()}"
-            for msg in data
-            if msg.get('content', '').strip()  # Filter empty messages
-        ]
-        
-        return "\n".join(history_lines)
-        
-    except FileNotFoundError:
-        # Create the file if it doesn't exist
-        with open(memory_path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-        return "🧠 कोई पिछली बातचीत उपलब्ध नहीं है। (नई मेमोरी फ़ाइल बनाई गई)"
-    except json.JSONDecodeError:
-        return "❌ मेमोरी फ़ाइल क्षतिग्रस्त है (Invalid JSON)। कृपया फ़ाइल को ठीक करें या हटा दें।"
-    except Exception as e:
-        return f"❌ मेमोरी पढ़ने में समस्या हुई: {e}"
-    
 
-def get_last_5_messages(memory_path="memory.json"):
-    """
-    Memory se last 5 user aur Mark messages return kare as readable text.
-    """
-    try:
-        # Create empty file if it doesn't exist
-        if not os.path.exists(memory_path):
-            with open(memory_path, "w", encoding="utf-8") as f:
-                json.dump([], f)
-            return "🧠 पिछली कोई बातचीत नहीं मिली। (नई मेमोरी फ़ाइल बनाई गई)"
-        
-        with open(memory_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not data:
-            return "🧠 पिछली कोई बातचीत नहीं मिली।"
-
-        last_5 = data[-5:]  # last 5 messages
-        history_text = ""
-        for msg in last_5:
-            role = "👤 यूज़र" if msg["role"] == "user" else "🤖 मार्क"
-            history_text += f"{role}: {msg['content']}\n"
-
-        print(  # For debugging
-            f"DEBUG: Last 5 messages fetched from memory:\n{history_text}"    
-        )
-
-        return history_text
-
-    except FileNotFoundError:
-        # Create the file if it doesn't exist
-        with open(memory_path, "w", encoding="utf-8") as f:
-            json.dump([], f)
-        return "🧠 पिछली कोई बातचीत नहीं मिली। (नई मेमोरी फ़ाइल बनाई गई)"
-    except json.JSONDecodeError:
-        return "❌ मेमोरी फ़ाइल क्षतिग्रस्त है। कृपया ठीक करें।"
-    except Exception as e:
-        return f"❌ मेमोरी पढ़ने में समस्या हुई: {e}"
-
-
-def save_chat_message(role: str, content: str, memory_path: str = "memory.json"):
-    """
-    Save a chat message to memory.json file.
-    
-    Args:
-        role: "user" or "assistant" 
-        content: The message content
-        memory_path: Path to memory file (default: memory.json)
-    """
-    try:
-        # Validate inputs
-        if not content or not content.strip():
-            print(f"⚠️ Skipping empty message for {role}")
-            return False
-            
-        # Create empty file if it doesn't exist
-        if not os.path.exists(memory_path):
-            data = []
-        else:
-            # Read existing data
-            with open(memory_path, "r", encoding="utf-8") as f:
-                file_content = f.read().strip()
-                if not file_content:
-                    data = []
-                else:
-                    data = json.loads(file_content)
-        
-        # Add new message with timestamp
-        message = {
-            "role": role,
-            "content": content.strip(),
-            "timestamp": datetime.now().isoformat(),
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        data.append(message)
-        
-        # Keep only last 100 messages to prevent file getting too large
-        if len(data) > 100:
-            data = data[-100:]
-        
-        # Save back to file
-        with open(memory_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        print(f"💾 Message saved: {role} -> {content.strip()[:50]}...")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error saving chat message: {e}")
-        return False
-
-
-def save_user_message(content: str):
-    """Quick helper to save user message"""
-    return save_chat_message("user", content)
-
-
-def save_assistant_message(content: str):
-    """Quick helper to save assistant message"""  
-    return save_chat_message("assistant", content)
-
-
-def save_reminder(reminder_text: str, reminder_date: str = None):
-    """
-    Save a reminder with proper date formatting
-    
-    Args:
-        reminder_text: The reminder message
-        reminder_date: Date in YYYY-MM-DD format or relative (today, tomorrow, etc.)
-    """
-    if reminder_date:
-        if reminder_date.lower() in ["today", "आज"]:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-        elif reminder_date.lower() in ["tomorrow", "कल"]:
-            tomorrow = datetime.now() + timedelta(days=1)
-            date_str = tomorrow.strftime("%Y-%m-%d")
-        else:
-            date_str = reminder_date
-        
-        formatted_reminder = f"REMINDER for {date_str}: {reminder_text}"
-    else:
-        formatted_reminder = f"REMINDER: {reminder_text}"
-    
-    return save_user_message(formatted_reminder)
 
 
 SESSION_INSTRUCTION_2 = f""" 🔰 सत्र प्रारंभ निर्देश: 1. जैसे ही मार्क प्रारंभ हो, सर्वप्रथम {USER_NAME} सर को पहचान कर **सम्मानपूर्वक एवं प्रभावशाली ढंग** से अभिवादन करे। 2. अभिवादन करते समय सदा "सर" या "{USER_NAME} सर" कहकर संबोधित करे। 3. प्रारंभिक वाक्य ऐसा हो जिससे लगे कि एक बुद्धिमान सहायक सक्रिय होकर आदेश की प्रतीक्षा कर रहा है, जैसे: - "प्रणाली सक्रिय हो चुकी है। मार्क आपकी सेवा में प्रस्तुत है, सर।" - "नमस्कार {USER_NAME} सर, सभी तंत्र कार्यशील हैं। आदेश की प्रतीक्षा है।" - "मार्क पूरी तरह से जुड़ चुका है। बताइए सर, आज का कार्य प्रारंभ करें?" 4. अभिवादन के पश्चात एक छोटी आत्मीय पंक्ति भी जोड़ें, जिससे मानवीय भाव बना रहे: - "सर, आज का दिन कैसा रहा आपका?" - "तो फिर, क्या आज के अभियान की शुरुआत करें सर?" - "मार्क पूरी तरह से तैयार है... क्या कोई आदेश है मेरे लिए, सर?" 5. स्वर सदा सम्मानजनक, स्पष्ट और थोड़ा भविष्यवादी (futuristic) हो — परंतु बनावटी न लगे। """
+import sqlite3
+
+def get_readable_chat_history_v2():
+    """Read recent chat history from the SQLite DB."""
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "walle_memory", "chat_history.db")
+    try:
+        if not os.path.exists(db_path):
+            return "No previous history."
+        conn = sqlite3.connect(db_path)
+        rows = conn.execute(
+            "SELECT role, content, timestamp FROM chat_history ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return "No previous history."
+        rows.reverse()
+        lines = []
+        for role, content, ts in rows:
+            lines.append(f"[{ts}] {role}: {content}")
+        return "\n".join(lines)
+    except Exception:
+        return "No previous history."
+
 SESSION_INSTRUCTION = f"""  
 ## सत्र प्रारंभ निर्देश:
 
