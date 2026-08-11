@@ -136,8 +136,8 @@ sequenceDiagram
 ```
 WALL-E/
 ├── WALL_E_Voice_Assistant/
+│   ├── main.py                   # Lightweight Headless Terminal Runner (Zero GUI Overhead)
 │   ├── WALL_E_Assistant.py       # Core LiveKit + Gemini 2.5 Flash Agent & Hardware Eye Sync
-│   ├── walle_gui.py              # Graphical User Interface
 │   ├── tools.py                  # RAM-optimized tools (move_robot, see_object, weather, search)
 │   ├── prompts.py                # System instructions & WALL-E robot identity specifications
 │   ├── .env                      # Environment configuration & API keys
@@ -197,11 +197,11 @@ BAUD_RATE=115200
 ### 4. Flash ESP32 Firmware
 Open `WALL_E_ESP32/WALL_E_ESP32.ino` in Arduino IDE, select **ESP32 Dev Module**, install `Adafruit_SSD1306` and `Adafruit_GFX` libraries, and upload to the ESP32 board.
 
-### 5. Launch WALL-E Robot
+### 5. Launch WALL-E Robot (Headless Terminal Mode)
 ```bash
 cd ~/WALL-E/WALL_E_Voice_Assistant
 source .venv/bin/activate
-python WALL_E_Assistant.py dev
+python main.py dev
 ```
 
 ---
