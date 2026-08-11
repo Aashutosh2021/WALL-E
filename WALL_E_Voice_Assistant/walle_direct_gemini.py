@@ -2,6 +2,7 @@
 WALL-E AI Companion Robot - Direct Gemini Multimodal Live Client
 Direct WebSocket to Google Gemini API (BidiGenerateContent)
 Ultra Low Latency (~300ms) & Ultra Low RAM Overhead (~30MB)
+Uses sounddevice for cross-platform zero-dependency audio I/O.
 """
 
 import os
@@ -9,6 +10,7 @@ import sys
 import asyncio
 import logging
 import traceback
+import sounddevice as sd
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
@@ -47,7 +49,7 @@ def set_eye_state(state: str):
     """Sends OLED eye animation command to ESP32 over UART serial."""
     send_uart_command(state)
 
-async def audio_input_loop(session, p_stream):
+async def audio_input_loop(session, mic_stream):
     """Captures mic audio & streams PCM chunks to Gemini Live WebSocket."""
     logger.info("🎤 Microphone audio streaming loop active...")
     CHUNK_SIZE = 1024
@@ -55,11 +57,11 @@ async def audio_input_loop(session, p_stream):
     
     while True:
         try:
-            data = await loop.run_in_executor(None, p_stream.read, CHUNK_SIZE, False)
+            data, overflowed = await loop.run_in_executor(None, mic_stream.read, CHUNK_SIZE)
             if data:
                 await session.send(
                     realtime_input=types.LiveClientRealtimeInput(
-                        media_chunks=[types.Blob(data=data, mime_type="audio/pcm")]
+                        media_chunks=[types.Blob(data=bytes(data), mime_type="audio/pcm")]
                     )
                 )
         except asyncio.CancelledError:
@@ -68,9 +70,10 @@ async def audio_input_loop(session, p_stream):
             logger.error(f"Mic input error: {e}")
             await asyncio.sleep(0.01)
 
-async def audio_output_loop(session, out_stream):
+async def audio_output_loop(session, speaker_stream):
     """Receives responses from Gemini Live WebSocket & plays audio / handles tool calls."""
     logger.info("🔊 Speaker playback loop active...")
+    loop = asyncio.get_running_loop()
     
     async for response in session.receive():
         server_content = response.server_content
@@ -80,7 +83,7 @@ async def audio_output_loop(session, out_stream):
                 for part in model_turn.parts:
                     if part.inline_data and part.inline_data.data:
                         set_eye_state("EYES_TALKING")
-                        out_stream.write(part.inline_data.data)
+                        await loop.run_in_executor(None, speaker_stream.write, part.inline_data.data)
                         
             if server_content.turn_complete:
                 set_eye_state("EYES_NORMAL")
@@ -149,26 +152,24 @@ async def run_direct_gemini_robot():
         tools=[move_robot, see_object, get_weather, get_time_info, search_web]
     )
 
-    # Initialize PyAudio for direct hardware audio stream
-    import pyaudio
-    p = pyaudio.PyAudio()
-
+    # Initialize SoundDevice streams
     # Input: 16kHz 16-bit Mono PCM
-    mic_stream = p.open(
-        format=pyaudio.paInt16,
+    mic_stream = sd.RawInputStream(
+        samplerate=16000,
         channels=1,
-        rate=16000,
-        input=True,
-        frames_per_buffer=1024
+        dtype='int16',
+        blocksize=1024
     )
 
     # Output: 24kHz 16-bit Mono PCM
-    speaker_stream = p.open(
-        format=pyaudio.paInt16,
+    speaker_stream = sd.RawOutputStream(
+        samplerate=24000,
         channels=1,
-        rate=24000,
-        output=True
+        dtype='int16'
     )
+
+    mic_stream.start()
+    speaker_stream.start()
 
     try:
         async with client.aio.live.connect(
@@ -186,11 +187,10 @@ async def run_direct_gemini_robot():
         logger.error(f"Direct Gemini Live error: {e}")
         traceback.print_exc()
     finally:
-        mic_stream.stop_stream()
+        mic_stream.stop()
         mic_stream.close()
-        speaker_stream.stop_stream()
+        speaker_stream.stop()
         speaker_stream.close()
-        p.terminate()
         set_eye_state("STOP")
 
 if __name__ == "__main__":
