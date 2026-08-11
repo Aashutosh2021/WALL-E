@@ -18,3 +18,6 @@ firebase_auth.py
 # Memory & database files
 mark_memory/
 *.db
+
+#Documents
+Repository File Structure & Cleanup Guide.md
