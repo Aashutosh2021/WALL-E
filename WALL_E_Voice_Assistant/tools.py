@@ -211,18 +211,3 @@ async def search_web(query: str) -> str:
         return f"❌ Web search failed: {str(e)}"
 
 
-@function_tool()
-async def play_media(media_name: str) -> str:
-    """
-    Plays requested song or audio/video media on YouTube or browser.
-    
-    Args:
-        media_name: Name of song or video to play
-    """
-    try:
-        search_url = f"https://www.youtube.com/results?search_query={media_name.replace(' ', '+')}"
-        webbrowser.open(search_url)
-        return f"🎵 Playing '{media_name}' on YouTube."
-    except Exception as e:
-        logger.error(f"play_media error: {e}")
-        return f"❌ Failed to play media: {str(e)}"
