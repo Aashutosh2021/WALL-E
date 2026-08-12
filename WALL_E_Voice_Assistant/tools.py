@@ -1,15 +1,11 @@
 import os
-import gc
 import cv2
 import time
 import json
 import logging
 import asyncio
 import aiohttp
-import webbrowser
 from datetime import datetime
-from typing import Optional, Literal
-from livekit.agents import function_tool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,26 +30,25 @@ def _probe_uart() -> bool:
 # Probe once — no repeated warnings during runtime
 _UART_AVAILABLE: bool = _probe_uart()
 
+import serial
+import logging
+
+logger = logging.getLogger(__name__)
+
 def send_uart_command(command: str) -> bool:
-    """Send command over UART hardware serial to ESP32.
-    Silently skips if UART is not available (e.g. running on Windows).
-    """
-    if not _UART_AVAILABLE:
-        return False  # silently ignore — no spam
-    formatted_cmd = f"{command.strip().upper()}\n"
+    """Sends command to ESP32 over USB"""
     try:
-        import serial
-        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1) as ser:
-            ser.write(formatted_cmd.encode('utf-8'))
-            logger.info(f"UART Sent: {formatted_cmd.strip()}")
-            return True
+        # UART serial0 ki jagah ab dedicated ttyUSB0 use hoga
+        with serial.Serial('/dev/ttyUSB0', 115200, timeout=1) as s:
+            s.write(f"{command}\n".encode('utf-8'))
+            logger.info(f"✅ USB Command Sent to ESP32: {command}")
+        return True
     except Exception as e:
-        logger.debug(f"UART write failed: {e}")
+        logger.error(f"❌ USB Communication Failed: {e}")
         return False
 
 
-@function_tool()
-async def move_robot(direction: Literal["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]) -> str:
+async def move_robot(direction: str) -> str:
     """
     Controls the WALL-E robot's movement by sending serial commands to the ESP32 motor driver.
     
@@ -72,7 +67,6 @@ async def move_robot(direction: Literal["FORWARD", "BACKWARD", "LEFT", "RIGHT", 
     return f"🤖 WALL-E robot moving {dir_upper}."
 
 
-@function_tool()
 async def see_object(prompt: str = "Describe what you see in front of the camera in 1-2 short sentences.") -> str:
     """
     Captures a frame using the camera and uses Gemini Vision to describe what is seen in front of WALL-E.
@@ -90,7 +84,7 @@ async def see_object(prompt: str = "Describe what you see in front of the camera
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
-        for _ in range(5):
+        for _ in range(2):
             cap.grab()
             
         ret, frame = cap.read()
@@ -143,10 +137,8 @@ async def see_object(prompt: str = "Describe what you see in front of the camera
                 os.remove(temp_filename)
             except Exception:
                 pass
-        gc.collect()
 
 
-@function_tool()
 async def get_weather(city: str = "Delhi") -> str:
     """
     Fetches real-time weather information for a specified city using Open-Meteo API.
@@ -186,7 +178,6 @@ async def get_weather(city: str = "Delhi") -> str:
         return f"❌ Failed to fetch weather: {str(e)}"
 
 
-@function_tool()
 async def get_time_info() -> str:
     """
     Returns current time, date, and day of the week.
@@ -198,7 +189,6 @@ async def get_time_info() -> str:
     return f"🕒 Current time is {time_str}, Date: {date_str} ({day_str})."
 
 
-@function_tool()
 async def search_web(query: str) -> str:
     """
     Performs a lightweight web search using Wikipedia / DuckDuckGo API.
@@ -228,5 +218,3 @@ async def search_web(query: str) -> str:
     except Exception as e:
         logger.error(f"search_web error: {e}")
         return f"❌ Web search failed: {str(e)}"
-
-

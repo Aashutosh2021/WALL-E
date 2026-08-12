@@ -1,7 +1,6 @@
 """
 WALL-E AI Companion Robot - Direct Gemini Multimodal Live Client
-Direct WebSocket to Google Gemini API (BidiGenerateContent)
-Native WebSocket Image Injection for Vision (No 404 REST API Errors!)
+Ultra-Low Latency Raw WebSocket to Google Gemini (BidiGenerateContent)
 """
 
 import os
@@ -11,14 +10,12 @@ import inspect
 import logging
 import json
 import base64
-import sqlite3
 import numpy as np
 import sounddevice as sd
 import websockets
-import aiohttp, cv2, gc, time as _time
+import aiohttp, cv2, time as _time
 from datetime import datetime
 
-# Absolute path to script directory (works regardless of CWD)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -39,40 +36,58 @@ from tools import send_uart_command
 is_ai_speaking = False
 
 # ---------------------------------------------------------------------------
-# Camera Frame Capture Helper (Runs in background thread)
+# Persistent Camera Manager — keeps camera warm to avoid ~1s re-init
 # ---------------------------------------------------------------------------
-def _capture_camera_jpeg_bytes() -> bytes | None:
-    """Captures a frame from webcam and returns raw JPEG bytes."""
-    try:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            logger.error("Camera error: Could not access video capture device.")
+class _CameraManager:
+    """Keeps the webcam open persistently for instant frame grabs."""
+    def __init__(self):
+        self._cap = None
+
+    def _ensure_open(self) -> bool:
+        if self._cap is not None and self._cap.isOpened():
+            return True
+        try:
+            self._cap = cv2.VideoCapture(0)
+            if not self._cap.isOpened():
+                self._cap = None
+                return False
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            logger.info("📷 Camera opened (persistent, 320x240).")
+            return True
+        except Exception as e:
+            logger.error(f"Camera open error: {e}")
+            self._cap = None
+            return False
+
+    def grab_jpeg(self) -> bytes | None:
+        """Grab a single frame as JPEG bytes (~10-30ms when camera is warm)."""
+        if not self._ensure_open():
             return None
-        
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        
-        # Sensor warmup frames
-        for _ in range(5): 
-            cap.grab()
-            
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret or frame is None:
-            logger.error("Camera error: Failed to capture frame.")
+        try:
+            # Flush stale buffer frame, then read fresh
+            self._cap.grab()
+            ret, frame = self._cap.read()
+            if not ret or frame is None:
+                return None
+            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+            return buf.tobytes() if ok else None
+        except Exception as e:
+            logger.error(f"Camera grab error: {e}")
+            # Reset on error — next call will re-open
+            try: self._cap.release()
+            except: pass
+            self._cap = None
             return None
-            
-        success, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        del frame
-        gc.collect()
-        
-        if success:
-            return buffer.tobytes()
-        return None
-    except Exception as e:
-        logger.error(f"Camera capture exception: {e}")
-        return None
+
+    def close(self):
+        if self._cap is not None:
+            try: self._cap.release()
+            except: pass
+            self._cap = None
+
+_camera = _CameraManager()
 
 # ---------------------------------------------------------------------------
 # Hardware & Software Tools
@@ -149,69 +164,18 @@ async def _remember_fact(fact: str) -> str:
     }
     memories.append(new_memory)
     
+    # Cap at 50 memories to prevent file bloat
+    if len(memories) > 50:
+        memories = memories[-50:]
+    
     try:
         with open(memory_file, "w", encoding="utf-8") as f:
             json.dump(memories, f, indent=2)
-        logger.info(f"🧠 Memory saved to {memory_file}: {fact}")
+        logger.info(f"🧠 Memory saved: {fact}")
         return f"✅ Memorized: {fact}"
     except Exception as e:
         logger.error(f"Failed to write to memory.json: {e}")
         return f"❌ Failed to memorize: {e}"
-
-
-# ---------------------------------------------------------------------------
-# SQLite Chat History — auto-saves every conversation turn
-# ---------------------------------------------------------------------------
-_CHAT_DB_PATH = os.path.join(_SCRIPT_DIR, "walle_memory", "chat_history.db")
-
-def _init_chat_db():
-    """Create the chat_history table if it doesn't exist."""
-    os.makedirs(os.path.dirname(_CHAT_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(_CHAT_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-    logger.info(f"🗄️ Chat history DB ready at {_CHAT_DB_PATH}")
-
-def save_chat_message(role: str, content: str):
-    """Save a single chat message (user or model) to the DB."""
-    try:
-        conn = sqlite3.connect(_CHAT_DB_PATH)
-        conn.execute(
-            "INSERT INTO chat_history (role, content, timestamp) VALUES (?, ?, ?)",
-            (role, content, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to save chat message: {e}")
-
-def get_recent_chat_history(limit: int = 50) -> str:
-    """Read the last N messages from DB and return as readable text."""
-    try:
-        conn = sqlite3.connect(_CHAT_DB_PATH)
-        rows = conn.execute(
-            "SELECT role, content, timestamp FROM chat_history ORDER BY id DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        conn.close()
-        if not rows:
-            return "No previous history."
-        rows.reverse()  # oldest first
-        lines = []
-        for role, content, ts in rows:
-            lines.append(f"[{ts}] {role}: {content}")
-        return "\n".join(lines)
-    except Exception as e:
-        logger.error(f"Failed to read chat history: {e}")
-        return "No previous history."
 
 TOOL_MAP = {
     "move_robot": _move_robot,
@@ -224,72 +188,63 @@ TOOL_MAP = {
 def set_eye_state(state: str):
     send_uart_command(state)
 
-def resample_24k_to_48k_clean(raw_pcm_bytes):
-    pcm_24k = np.frombuffer(raw_pcm_bytes, dtype=np.int16)
-    if len(pcm_24k) == 0:
+# ---------------------------------------------------------------------------
+# OPTIMIZED Audio Helpers — zero-copy where possible
+# ---------------------------------------------------------------------------
+def _resample_24k_to_48k(raw_pcm_bytes: bytes) -> bytes:
+    """Ultra-fast 2x upsample via np.repeat (zero interpolation overhead)."""
+    pcm = np.frombuffer(raw_pcm_bytes, dtype=np.int16)
+    if len(pcm) == 0:
         return b""
-    old_indices = np.arange(len(pcm_24k))
-    new_indices = np.linspace(0, len(pcm_24k) - 1, len(pcm_24k) * 2)
-    pcm_48k = np.interp(new_indices, old_indices, pcm_24k).astype(np.int16)
-    return pcm_48k.tobytes()
+    return np.repeat(pcm, 2).tobytes()
 
 def _open_speaker_stream():
+    """Open speaker at highest supported rate. Returns (stream, rate)."""
     for rate in [48000, 44100, 24000]:
         try:
             stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype='int16')
             stream.start()
-            logger.info(f"🔊 Speaker output stream opened successfully at {rate}Hz.")
+            logger.info(f"🔊 Speaker opened at {rate}Hz.")
             return stream, rate
-        except Exception as e:
-            logger.debug(f"Failed opening speaker at {rate}Hz: {e}")
+        except Exception:
             continue
-
     logger.warning("❌ Could not open any speaker output stream.")
     return None, 48000
 
 # ---------------------------------------------------------------------------
 # WebSocket Audio Input & Output Loops
 # ---------------------------------------------------------------------------
+MIC_CHUNK = 1024  # 64ms at 16kHz — half the old 128ms for faster voice detection
+
 async def send_audio_loop(ws, mic_stream):
     """Streams recorded microphone PCM audio chunks over WebSocket."""
-    logger.info("🎤 Microphone streaming loop active...")
+    logger.info("🎤 Mic streaming active (64ms chunks)...")
     loop = asyncio.get_running_loop()
-    CHUNK_SIZE = 2048 
 
     while True:
         try:
-            data, overflowed = await loop.run_in_executor(None, mic_stream.read, CHUNK_SIZE)
+            data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
             if data:
-                if is_ai_speaking:
-                    data_bytes = b'\x00' * len(data)
-                else:
-                    data_bytes = bytes(data)
-
-                base64_audio = base64.b64encode(data_bytes).decode("utf-8")
-                msg = {
+                raw = b'\x00' * len(data) if is_ai_speaking else bytes(data)
+                b64 = base64.b64encode(raw).decode("utf-8")
+                await ws.send(json.dumps({
                     "realtimeInput": {
-                        "mediaChunks": [
-                            {
-                                "mimeType": "audio/pcm;rate=16000",
-                                "data": base64_audio
-                            }
-                        ]
+                        "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
                     }
-                }
-                await ws.send(json.dumps(msg))
+                }))
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning(f"Mic input error: {e}")
+            logger.warning(f"Mic error: {e}")
             break
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
     """Receives Gemini Live WebSocket messages (Audio, Camera requests & Tool Calls)."""
     global is_ai_speaking
     speaker_stream, active_rate = speaker_stream_tuple
-    logger.info("🔊 Speaker playback listener active...")
+    logger.info("🔊 Speaker listener active...")
     loop = asyncio.get_running_loop()
-    _current_turn_text = []  # accumulate text parts from model turn
+    need_resample = (active_rate == 48000)
 
     try:
         async for message in ws:
@@ -304,16 +259,11 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                 if server_content.get("interrupted"):
                     is_ai_speaking = False
                     set_eye_state("EYES_NORMAL")
-                    _current_turn_text.clear()
 
                 model_turn = server_content.get("modelTurn")
                 if model_turn:
                     parts = model_turn.get("parts", [])
                     for part in parts:
-                        # Capture any text parts from the model
-                        if "text" in part and part["text"].strip():
-                            _current_turn_text.append(part["text"])
-
                         inline_data = part.get("inlineData")
                         if inline_data and inline_data.get("data"):
                             is_ai_speaking = True
@@ -323,26 +273,17 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             if len(audio_bytes) % 2 != 0:
                                 audio_bytes = audio_bytes[:-1]
 
-                            if active_rate == 48000:
-                                audio_to_play = resample_24k_to_48k_clean(audio_bytes)
-                            else:
-                                audio_to_play = audio_bytes
+                            if need_resample:
+                                audio_bytes = _resample_24k_to_48k(audio_bytes)
 
                             if speaker_stream:
                                 await loop.run_in_executor(
-                                    None, speaker_stream.write, audio_to_play
+                                    None, speaker_stream.write, audio_bytes
                                 )
 
                 if server_content.get("turnComplete"):
                     is_ai_speaking = False
                     set_eye_state("EYES_NORMAL")
-                    # Auto-save any text the model produced this turn
-                    if _current_turn_text:
-                        full_text = " ".join(_current_turn_text).strip()
-                        if full_text:
-                            save_chat_message("model", full_text)
-                            logger.info(f"💾 Auto-saved model response to chat history")
-                        _current_turn_text.clear()
 
             # Handle Tool Calls
             tool_call = data.get("toolCall")
@@ -354,30 +295,41 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                     call_id = call.get("id")
                     args = call.get("args", {})
 
-                    logger.info(f"🔧 Tool Call Triggered: {fn_name}({args})")
-                    # Save user's tool request to chat history
-                    save_chat_message("user_tool", f"[Tool: {fn_name}] {json.dumps(args, ensure_ascii=False)}")
+                    logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Special Direct Handling for Camera Vision
+                    # 📸 Camera Vision — fixed protocol: toolResponse FIRST, then image
                     if fn_name == "see_object":
-                        logger.info("📸 Capturing photo for Gemini Live Vision...")
-                        jpeg_bytes = await loop.run_in_executor(None, _capture_camera_jpeg_bytes)
-                        
+                        logger.info("📸 Capturing photo...")
+                        jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
+
                         if jpeg_bytes:
-                            # 1. Inject JPEG photo directly into Gemini Live WebSocket
-                            base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-                            img_msg = {
-                                "realtimeInput": {
-                                    "mediaChunks": [
-                                        {
-                                            "mimeType": "image/jpeg",
-                                            "data": base64_img
-                                        }
-                                    ]
+                            # STEP 1: Complete the tool call FIRST (Gemini is waiting for this)
+                            prompt_text = args.get("prompt", "Describe what you see.")
+                            await ws.send(json.dumps({
+                                "toolResponse": {
+                                    "functionResponses": [{
+                                        "response": {"output": f"Photo captured ({len(jpeg_bytes)} bytes). Sending image now."},
+                                        "id": call_id
+                                    }]
                                 }
-                            }
-                            await ws.send(json.dumps(img_msg))
-                            tool_result = "Photo captured and injected into your vision stream. Describe what you see in the photo."
+                            }))
+
+                            # STEP 2: Now inject the image as a proper user turn
+                            base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
+                            await ws.send(json.dumps({
+                                "clientContent": {
+                                    "turns": [{
+                                        "role": "user",
+                                        "parts": [
+                                            {"inlineData": {"mimeType": "image/jpeg", "data": base64_img}},
+                                            {"text": prompt_text}
+                                        ]
+                                    }],
+                                    "turnComplete": True
+                                }
+                            }))
+                            logger.info(f"✅ Photo injected ({len(jpeg_bytes)}B)")
+                            continue  # skip the generic toolResponse below — already sent
                         else:
                             tool_result = "Failed to capture photo from camera."
 
@@ -394,21 +346,16 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                     else:
                         tool_result = f"Unknown tool '{fn_name}'"
 
-                    # 2. Send Tool Response Back over WebSocket
-                    tool_resp_msg = {
+                    # Send Tool Response Back
+                    await ws.send(json.dumps({
                         "toolResponse": {
-                            "functionResponses": [
-                                {
-                                    "response": {"output": str(tool_result)},
-                                    "id": call_id
-                                }
-                            ]
+                            "functionResponses": [{
+                                "response": {"output": str(tool_result)},
+                                "id": call_id
+                            }]
                         }
-                    }
-                    await ws.send(json.dumps(tool_resp_msg))
-                    logger.info(f"✅ Tool Response Sent: {tool_result}")
-                    # Save tool result to chat history
-                    save_chat_message("tool_result", f"[{fn_name}] {str(tool_result)[:500]}")
+                    }))
+                    logger.info(f"✅ Tool done: {tool_result[:80]}")
 
                 set_eye_state("EYES_NORMAL")
 
@@ -426,13 +373,10 @@ async def run_direct_gemini_robot():
         logger.error("❌ GOOGLE_API_KEY is missing in .env!")
         return
 
-    logger.info("⚡ Booting Direct Gemini Live Raw WebSocket Client...")
+    logger.info("⚡ Booting WALL-E (Ultra-Low Latency Mode)...")
     set_eye_state("EYES_NORMAL")
     
-    # Initialize chat history database
-    _init_chat_db()
-
-    # Load past memory from memory.json
+    # Load past memory from memory.json (compact — max 20 most recent facts)
     memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
     past_memory_text = ""
     if os.path.exists(memory_file):
@@ -442,25 +386,21 @@ async def run_direct_gemini_robot():
                 if content:
                     memories = json.loads(content)
                     if isinstance(memories, list) and len(memories) > 0:
-                        past_memory_text = "\n\n--- PAST MEMORIES & FACTS ---\n"
-                        for m in memories:
+                        # Only inject last 20 facts to keep system prompt small
+                        recent = memories[-20:]
+                        past_memory_text = "\n\nPAST MEMORIES:\n"
+                        for m in recent:
                             if "fact" in m:
-                                past_memory_text += f"- [{m.get('date')}] {m['fact']}\n"
+                                past_memory_text += f"- {m['fact']}\n"
                             elif "content" in m:
-                                past_memory_text += f"- [{m.get('date')}] {m.get('role', 'unknown')}: {m['content']}\n"
+                                past_memory_text += f"- {m['content']}\n"
         except Exception as e:
-            logger.error(f"Failed to load memory for initialization: {e}")
-
-    # Load past chat history from SQLite
-    past_chat_text = get_recent_chat_history(50)
-    if past_chat_text and past_chat_text != "No previous history.":
-        past_memory_text += "\n\n--- PAST CONVERSATIONS ---\n" + past_chat_text + "\n"
-        logger.info("🧠 Loaded past chat history from SQLite DB")
+            logger.error(f"Failed to load memory: {e}")
 
     final_instruction = AGENT_INSTRUCTION
     if past_memory_text:
         final_instruction += past_memory_text
-        logger.info(f"🧠 Loaded past memories from {memory_file}")
+        logger.info("🧠 Loaded past memories.")
 
     url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={api_key}"
 
@@ -483,7 +423,7 @@ async def run_direct_gemini_robot():
                     "functionDeclarations": [
                         {
                             "name": "remember_fact",
-                            "description": "Saves an important fact, reminder, or user detail to WALL-E's long-term memory so he remembers it forever.",
+                            "description": "Saves an important fact, reminder, or user detail to WALL-E's long-term memory.",
                             "parameters": {
                                 "type": "OBJECT",
                                 "properties": {
@@ -552,15 +492,15 @@ async def run_direct_gemini_robot():
         samplerate=16000,
         channels=1,
         dtype='int16',
-        blocksize=2048
+        blocksize=MIC_CHUNK
     )
     mic_stream.start()
     speaker_stream_info = _open_speaker_stream()
 
     try:
-        logger.info("📡 Connecting to Google Gemini Live WebSocket...")
+        logger.info("📡 Connecting to Gemini Live WebSocket...")
         async with websockets.connect(url) as ws:
-            logger.info("🚀 CONNECTED TO GEMINI LIVE WEBSOCKET!")
+            logger.info("🚀 CONNECTED TO GEMINI LIVE!")
 
             await ws.send(json.dumps(setup_payload))
 
@@ -574,6 +514,7 @@ async def run_direct_gemini_robot():
     finally:
         mic_stream.stop()
         mic_stream.close()
+        _camera.close()  # release persistent camera
         if speaker_stream_info[0] is not None:
             speaker_stream_info[0].stop()
             speaker_stream_info[0].close()
@@ -583,4 +524,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_direct_gemini_robot())
     except KeyboardInterrupt:
-        logger.info("🛑 WALL-E Direct Gemini Live Stopped by User.")
+        logger.info("🛑 WALL-E Stopped.")
