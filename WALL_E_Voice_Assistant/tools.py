@@ -38,13 +38,12 @@ logger = logging.getLogger(__name__)
 def send_uart_command(command: str) -> bool:
     """Sends command to ESP32 over USB"""
     try:
-        # UART serial0 ki jagah ab dedicated ttyUSB0 use hoga
-        with serial.Serial('/dev/ttyUSB0', 115200, timeout=1) as s:
+        with serial.Serial('/dev/ttyUSB0', 115200, timeout=0.1) as s:
             s.write(f"{command}\n".encode('utf-8'))
             logger.info(f"✅ USB Command Sent to ESP32: {command}")
         return True
     except Exception as e:
-        logger.error(f"❌ USB Communication Failed: {e}")
+        logger.error(f"❌ USB Communication Error: {e}")
         return False
 
 

@@ -10,6 +10,8 @@ import inspect
 import logging
 import json
 import base64
+import subprocess
+import shutil
 import numpy as np
 import sounddevice as sd
 import websockets
@@ -36,56 +38,94 @@ from tools import send_uart_command
 is_ai_speaking = False
 
 # ---------------------------------------------------------------------------
-# Persistent Camera Manager — keeps camera warm to avoid ~1s re-init
+# Multi-Strategy Camera — rpicam-still (Pi CSI) → OpenCV (USB/Windows)
 # ---------------------------------------------------------------------------
-class _CameraManager:
-    """Keeps the webcam open persistently for instant frame grabs."""
-    def __init__(self):
-        self._cap = None
+_HAS_RPICAM = shutil.which("rpicam-still") is not None
+_HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
 
-    def _ensure_open(self) -> bool:
-        if self._cap is not None and self._cap.isOpened():
-            return True
-        try:
-            self._cap = cv2.VideoCapture(0)
-            if not self._cap.isOpened():
-                self._cap = None
-                return False
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            logger.info("📷 Camera opened (persistent, 320x240).")
-            return True
-        except Exception as e:
-            logger.error(f"Camera open error: {e}")
-            self._cap = None
-            return False
+class _CameraManager:
+    """Captures frames using the best available method for the platform."""
+    def __init__(self):
+        self._cv_cap = None
+        if _HAS_RPICAM:
+            logger.info("📷 Camera backend: rpicam-still (Pi CSI)")
+        elif _HAS_LIBCAMERA:
+            logger.info("📷 Camera backend: libcamera-still (Pi CSI legacy)")
+        else:
+            logger.info("📷 Camera backend: OpenCV (USB/Windows)")
 
     def grab_jpeg(self) -> bytes | None:
-        """Grab a single frame as JPEG bytes (~10-30ms when camera is warm)."""
-        if not self._ensure_open():
-            return None
+        """Grab a single JPEG frame using the best available method."""
+        # Strategy 1: rpicam-still (modern Raspberry Pi OS 64-bit)
+        if _HAS_RPICAM:
+            return self._grab_rpicam()
+        # Strategy 2: libcamera-still (older Pi OS)
+        if _HAS_LIBCAMERA:
+            return self._grab_libcamera()
+        # Strategy 3: OpenCV (USB cameras, Windows)
+        return self._grab_opencv()
+
+    def _grab_rpicam(self) -> bytes | None:
         try:
-            # Flush stale buffer frame, then read fresh
-            self._cap.grab()
-            ret, frame = self._cap.read()
+            result = subprocess.run(
+                ["rpicam-still", "--output", "-", "--width", "320", "--height", "240",
+                 "--quality", "50", "--nopreview", "--immediate", "1",
+                 "--encoding", "jpg", "--timeout", "1"],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0 and len(result.stdout) > 100:
+                logger.info(f"📸 rpicam-still captured {len(result.stdout)}B")
+                return result.stdout
+            logger.warning(f"rpicam-still failed: rc={result.returncode} stderr={result.stderr[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"rpicam-still error: {e}")
+            return None
+
+    def _grab_libcamera(self) -> bytes | None:
+        try:
+            result = subprocess.run(
+                ["libcamera-still", "--output", "-", "--width", "320", "--height", "240",
+                 "--quality", "50", "--nopreview", "--immediate",
+                 "--encoding", "jpg", "--timeout", "1"],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0 and len(result.stdout) > 100:
+                logger.info(f"📸 libcamera-still captured {len(result.stdout)}B")
+                return result.stdout
+            return None
+        except Exception as e:
+            logger.error(f"libcamera-still error: {e}")
+            return None
+
+    def _grab_opencv(self) -> bytes | None:
+        try:
+            if self._cv_cap is None or not self._cv_cap.isOpened():
+                self._cv_cap = cv2.VideoCapture(0)
+                if not self._cv_cap.isOpened():
+                    self._cv_cap = None
+                    return None
+                self._cv_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                self._cv_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                self._cv_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self._cv_cap.grab()  # flush stale frame
+            ret, frame = self._cv_cap.read()
             if not ret or frame is None:
                 return None
             ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
             return buf.tobytes() if ok else None
         except Exception as e:
-            logger.error(f"Camera grab error: {e}")
-            # Reset on error — next call will re-open
-            try: self._cap.release()
+            logger.error(f"OpenCV grab error: {e}")
+            try: self._cv_cap.release()
             except: pass
-            self._cap = None
+            self._cv_cap = None
             return None
 
     def close(self):
-        if self._cap is not None:
-            try: self._cap.release()
+        if self._cv_cap is not None:
+            try: self._cv_cap.release()
             except: pass
-            self._cap = None
+            self._cv_cap = None
 
 _camera = _CameraManager()
 
@@ -185,8 +225,26 @@ TOOL_MAP = {
     "remember_fact": _remember_fact,
 }
 
+# State track karne ke liye global variable
+_current_eye_state = None
+
 def set_eye_state(state: str):
-    send_uart_command(state)
+    """Sends eye animation command over USB only if state actually changes."""
+    global _current_eye_state
+    
+    valid_states = ["BOOT", "IDLE", "LISTEN", "SPEAK", "EYES_TALKING", "EYES_NORMAL", "THINK", "STOP", "HAPPY", "SAD", "ANGRY"]
+    if state not in valid_states:
+        return
+        
+    # Ignore duplicate commands (Pehle se EYES_TALKING hai toh wapas mat bhejo)
+    if state == _current_eye_state:
+        return
+        
+    _current_eye_state = state
+    logger.info(f"👁️ Eye state changed to: {state}")
+    
+    # Run serial write in a background thread so audio playback never stutters
+    asyncio.get_event_loop().run_in_executor(None, send_uart_command, state)
 
 # ---------------------------------------------------------------------------
 # OPTIMIZED Audio Helpers — zero-copy where possible
@@ -297,35 +355,30 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — fixed protocol: toolResponse FIRST, then image
+                    # 📸 Camera Vision — toolResponse FIRST, then image via realtimeInput
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
 
                         if jpeg_bytes:
-                            # STEP 1: Complete the tool call FIRST (Gemini is waiting for this)
+                            # STEP 1: Complete the tool call FIRST (Gemini is waiting)
                             prompt_text = args.get("prompt", "Describe what you see.")
                             await ws.send(json.dumps({
                                 "toolResponse": {
                                     "functionResponses": [{
-                                        "response": {"output": f"Photo captured ({len(jpeg_bytes)} bytes). Sending image now."},
+                                        "response": {"output": f"Photo captured. {prompt_text}"},
                                         "id": call_id
                                     }]
                                 }
                             }))
 
-                            # STEP 2: Now inject the image as a proper user turn
+                            # STEP 2: Inject image via realtimeInput (safe for audio mode)
                             base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
                             await ws.send(json.dumps({
-                                "clientContent": {
-                                    "turns": [{
-                                        "role": "user",
-                                        "parts": [
-                                            {"inlineData": {"mimeType": "image/jpeg", "data": base64_img}},
-                                            {"text": prompt_text}
-                                        ]
-                                    }],
-                                    "turnComplete": True
+                                "realtimeInput": {
+                                    "mediaChunks": [
+                                        {"mimeType": "image/jpeg", "data": base64_img}
+                                    ]
                                 }
                             }))
                             logger.info(f"✅ Photo injected ({len(jpeg_bytes)}B)")

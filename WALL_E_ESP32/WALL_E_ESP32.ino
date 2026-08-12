@@ -1,9 +1,9 @@
-#include <WiFi.h>
 #include <WebServer.h>
+#include <WiFi.h>
 
 // --- Network Configurations ---
-const char* ssid = "WALL-E_AP";         // ESP32 Access Point Name
-const char* password = "password2026";    // AP Password (Min 8 chars)
+const char *ssid = "WALL-E_AP";       // ESP32 Access Point Name
+const char *password = "password123"; // AP Password (Min 8 chars)
 
 // Static IP Configuration
 IPAddress local_IP(192, 168, 4, 17);
@@ -12,131 +12,200 @@ IPAddress subnet(255, 255, 255, 0);
 
 WebServer server(80);
 
-// --- Circular Buffer for Live Web Logs ---
+// --- System State & Circular Buffer for Logs ---
+String currentEyeState = "IDLE"; // Track current visual eye state
 const int MAX_LOGS = 30;
 String logBuffer[MAX_LOGS];
 int logIndex = 0;
 
-// Function to add a log message with a timestamp
 void appendLog(String message) {
   unsigned long ms = millis();
   String timestamp = "[" + String(ms / 1000.0, 2) + "s] ";
-  
+
   logBuffer[logIndex] = timestamp + message;
   logIndex = (logIndex + 1) % MAX_LOGS;
-  
-  // Serial Monitor monitor pe bhi debug print hoga
-  Serial.println(timestamp + message); 
+  Serial.println(timestamp + message);
 }
 
-// --- HTML + JS Webpage Layout ---
+// --- HTML + CSS3 + Dynamic Eye Animations Page ---
 void handleRoot() {
   String html = "<!DOCTYPE html><html><head>";
-  html += "<title>WALL-E Hardware Debug Console</title>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>WALL-E Hardware Debug & Eye Display</title>";
+  html +=
+      "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<style>";
-  html += "body { font-family: 'Segoe UI', Arial, sans-serif; background-color: #1e1e24; color: #f4f4f9; padding: 20px; margin: 0; }";
-  html += ".container { max-width: 900px; margin: 0 auto; }";
-  html += "h2 { color: #ff9f1c; border-bottom: 2px solid #ff9f1c; padding-bottom: 10px; font-weight: 500; }";
-  html += "#console { background-color: #0b0c10; border: 1px solid #45f3ff; border-radius: 8px; padding: 15px; height: 450px; overflow-y: auto; font-family: 'Courier New', monospace; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }";
-  html += ".log-entry { margin-bottom: 8px; line-height: 1.4; border-left: 3px solid #4e4e50; padding-left: 8px; }";
-  html += ".cmd-in { color: #4dfd60; }";      // Incoming commands = Green
-  html += ".cmd-exec { color: #ff9f1c; }";    // Execution status = Orange
-  html += ".sys-info { color: #00d2ff; }";    // System Info = Blue
-  html += "footer { margin-top: 20px; text-align: center; color: #666; font-size: 0.9em; }";
+  html +=
+      "body { font-family: 'Segoe UI', Arial, sans-serif; background-color: "
+      "#121214; color: #f4f4f9; padding: 15px; margin: 0; }";
+  html += ".container { max-width: 850px; margin: 0 auto; }";
+  html += "h2 { color: #ff9f1c; text-align: center; margin-bottom: 15px; "
+          "font-weight: 600; text-transform: uppercase; letter-spacing: 1px; }";
+
+  // --- OLED Head Visor & Eye CSS Styles ---
+  html +=
+      ".visor-box { background: #000; border: 3px solid #333; border-radius: "
+      "20px; padding: 25px; margin-bottom: 20px; box-shadow: 0 0 20px "
+      "rgba(0,210,255,0.2); text-align: center; position: relative; }";
+  html += ".eye-frame { display: flex; justify-content: center; align-items: "
+          "center; gap: 40px; height: 130px; }";
+  html += ".eye { width: 90px; height: 90px; background: #00d2ff; "
+          "border-radius: 50%; box-shadow: 0 0 25px #00d2ff, inset 0 0 15px "
+          "#fff; transition: all 0.2s ease-in-out; position: relative; }";
+  html += ".eye-status-tag { margin-top: 15px; font-family: monospace; "
+          "font-size: 1.1em; color: #ff9f1c; letter-spacing: 2px; }";
+
+  // --- Dynamic CSS State Animations ---
+  // 1. TALKING / SPEAK Animation (Pulsing height)
+  html += "@keyframes talk { 0%, 100% { transform: scaleY(1); } 50% { "
+          "transform: scaleY(0.3); } }";
+  html += ".state-EYES_TALKING .eye, .state-SPEAK .eye { animation: talk 0.25s "
+          "infinite alternate; background: #00ff88; box-shadow: 0 0 25px "
+          "#00ff88; }";
+
+  // 2. LISTEN Animation (Wide glowing eyes)
+  html += ".state-LISTEN .eye { transform: scale(1.15); background: #45f3ff; "
+          "box-shadow: 0 0 35px #45f3ff; }";
+
+  // 3. THINK Animation (Pulse glow)
+  html += "@keyframes pulse { 0% { opacity: 0.3; } 100% { opacity: 1; } }";
+  html += ".state-THINK .eye { animation: pulse 0.5s infinite alternate; "
+          "background: #ffbe0b; box-shadow: 0 0 25px #ffbe0b; }";
+
+  // 4. HAPPY Animation (Curved Arcs)
+  html += ".state-HAPPY .eye { border-radius: 50% 50% 15% 15%; transform: "
+          "scaleY(0.8); background: #ff007f; box-shadow: 0 0 25px #ff007f; }";
+
+  // 5. ANGRY Animation (Slanted Eyebrows)
+  html += ".state-ANGRY .eye.left { transform: rotate(20deg) scaleY(0.7); "
+          "background: #ff3333; box-shadow: 0 0 25px #ff3333; }";
+  html += ".state-ANGRY .eye.right { transform: rotate(-20deg) scaleY(0.7); "
+          "background: #ff3333; box-shadow: 0 0 25px #ff3333; }";
+
+  // 6. SAD Animation (Droopy Eyes)
+  html += ".state-SAD .eye.left { transform: rotate(-15deg) scaleY(0.7); "
+          "background: #3a86ff; }";
+  html += ".state-SAD .eye.right { transform: rotate(15deg) scaleY(0.7); "
+          "background: #3a86ff; }";
+
+  // 7. STOP / BOOT
+  html += ".state-STOP .eye { background: #333; box-shadow: none; }";
+
+  // --- Terminal Console CSS ---
+  html += "#console { background-color: #0b0c10; border: 1px solid #1f242d; "
+          "border-radius: 10px; padding: 15px; height: 300px; overflow-y: "
+          "auto; font-family: 'Courier New', monospace; font-size: 0.9em; "
+          "box-shadow: inset 0 0 10px rgba(0,0,0,0.8); }";
+  html += ".log-entry { margin-bottom: 6px; line-height: 1.3; border-left: 3px "
+          "solid #333; padding-left: 8px; }";
+  html += ".cmd-in { color: #00ff88; border-color: #00ff88; }";
+  html += ".cmd-exec { color: #ff9f1c; border-color: #ff9f1c; }";
+  html += ".sys-info { color: #00d2ff; border-color: #00d2ff; }";
   html += "</style>";
-  
-  // Auto-refresh script (Every 1 second AJAX pull)
+
+  // --- AJAX Auto-Refresh Script ---
   html += "<script>";
   html += "setInterval(function() {";
   html += "  var xhttp = new XMLHttpRequest();";
   html += "  xhttp.onreadystatechange = function() {";
   html += "    if (this.readyState == 4 && this.status == 200) {";
+  html += "      var parts = this.responseText.split('|||');";
+  html += "      var state = parts[0].trim();";
+  html += "      var logsHtml = parts[1];";
+
+  // Update Eye Screen CSS Class dynamically
+  html += "      var visor = document.getElementById('visor');";
+  html += "      visor.className = 'visor-box state-' + state;";
+  html += "      document.getElementById('state-text').innerText = 'STATE: ' + "
+          "state;";
+
+  // Update Console Logs
   html += "      var el = document.getElementById('console');";
-  html += "      var isScrolledToBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 1;";
-  html += "      el.innerHTML = this.responseText;";
+  html += "      var isScrolledToBottom = el.scrollHeight - el.clientHeight <= "
+          "el.scrollTop + 2;";
+  html += "      el.innerHTML = logsHtml;";
   html += "      if(isScrolledToBottom) { el.scrollTop = el.scrollHeight; }";
   html += "    }";
   html += "  };";
-  html += "  xhttp.open('GET', '/getLogs', true);";
+  html += "  xhttp.open('GET', '/getStatus', true);";
   html += "  xhttp.send();";
-  html += "}, 1000);";
+  html += "}, 200);"; // Fast 200ms polling for smooth eye state switching
   html += "</script>";
-  
+
   html += "</head><body><div class='container'>";
-  html += "<h2>🤖 WALL-E Robot Hardware Live Debug Console</h2>";
-  html += "<div id='console'>";
-  
-  // Load initial logs
-  for (int i = 0; i < MAX_LOGS; i++) {
-    int idx = (logIndex + i) % MAX_LOGS;
-    if (logBuffer[idx].length() > 0) {
-      html += "<div class='log-entry'>" + logBuffer[idx] + "</div>";
-    }
-  }
-  
+  html += "<h2>🤖 WALL-E AI Companion Screen Preview</h2>";
+
+  // OLED Visor Screen Markup
+  html += "<div id='visor' class='visor-box state-IDLE'>";
+  html += "  <div class='eye-frame'>";
+  html += "    <div class='eye left'></div>";
+  html += "    <div class='eye right'></div>";
+  html += "  </div>";
+  html += "  <div id='state-text' class='eye-status-tag'>STATE: IDLE</div>";
   html += "</div>";
-  html += "<footer>ESP32 IP: 192.168.4.17 | Baud Rate: 115200</footer>";
+
+  // Terminal Console Markup
+  html += "<div id='console'>Initializing Console...</div>";
+  html +=
+      "<footer style='text-align:center; margin-top:10px; color:#555; "
+      "font-size:0.8em;'>ESP32 Live Screen Mirror | IP: 192.168.4.17</footer>";
   html += "</div></body></html>";
-  
+
   server.send(200, "text/html", html);
 }
 
-// --- AJAX Endpoint to fetch logs asynchronously ---
-void handleGetLogs() {
-  String response = "";
+// --- Combined AJAX Status Endpoint (Eye State + Logs) ---
+void handleGetStatus() {
+  String logsHtml = "";
   for (int i = 0; i < MAX_LOGS; i++) {
     int idx = (logIndex + i) % MAX_LOGS;
     if (logBuffer[idx].length() > 0) {
       String line = logBuffer[idx];
-      
-      // Syntax highlighting tags for display formatting
-      if (line.indexOf("UART Rx:") != -1) {
-        response += "<div class='log-entry cmd-in'>" + line + "</div>";
+      if (line.indexOf("USB Rx:") != -1) {
+        logsHtml += "<div class='log-entry cmd-in'>" + line + "</div>";
       } else if (line.indexOf("Executed:") != -1) {
-        response += "<div class='log-entry cmd-exec'>" + line + "</div>";
+        logsHtml += "<div class='log-entry cmd-exec'>" + line + "</div>";
       } else {
-        response += "<div class='log-entry sys-info'>" + line + "</div>";
+        logsHtml += "<div class='log-entry sys-info'>" + line + "</div>";
       }
     }
   }
+
+  // Send Delimiter separated string: STATE|||LOGS
+  String response = currentEyeState + "|||" + logsHtml;
   server.send(200, "text/plain", response);
 }
 
-// --- Dynamic Hardware Command Processor ---
+// --- Command Execution & State Switcher ---
 void executeCommand(String cmd) {
   cmd.trim();
-  if (cmd.length() == 0) return;
+  if (cmd.length() == 0)
+    return;
 
-  // 1. Handle Eye States
-  if (cmd == "BOOT") {
-    appendLog("Executed: Visual State -> Triggered BOOT Sequence.");
-  } else if (cmd == "IDLE") {
-    appendLog("Executed: Visual State -> Eyes Set to Normal Idle.");
+  // Update Eye State Variable
+  if (cmd == "EYES_TALKING" || cmd == "SPEAK") {
+    currentEyeState = "EYES_TALKING";
+  } else if (cmd == "EYES_NORMAL" || cmd == "IDLE") {
+    currentEyeState = "IDLE";
   } else if (cmd == "LISTEN") {
-    appendLog("Executed: Visual State -> Eyes Set to Listening Glowing Mode.");
-  } else if (cmd == "SPEAK") {
-    appendLog("Executed: Visual State -> Eyes Set to Speaking Animation.");
+    currentEyeState = "LISTEN";
   } else if (cmd == "THINK") {
-    appendLog("Executed: Visual State -> Eyes Set to Thinking Processing Style.");
+    currentEyeState = "THINK";
+  } else if (cmd == "HAPPY") {
+    currentEyeState = "HAPPY";
+  } else if (cmd == "ANGRY") {
+    currentEyeState = "ANGRY";
+  } else if (cmd == "SAD") {
+    currentEyeState = "SAD";
   } else if (cmd == "STOP") {
-    appendLog("Executed: System State -> Emergency Halt Activated.");
-    
-  // 2. Handle Motor Movements (e.g., MOVE_FORWARD_500)
-  } else if (cmd.startsWith("MOVE_")) {
-    appendLog("Executed: Motor Drive -> Command parsed: " + cmd);
-  } else {
-    appendLog("Executed: WARNING -> Unknown or unmapped packet input: " + cmd);
+    currentEyeState = "STOP";
   }
+
+  appendLog("Executed: Eye Display -> Switched state to " + cmd);
 }
 
 void setup() {
-  // Serial0 configuration for standard USB PC debug
+  // Serial0 (USB to Raspberry Pi)
   Serial.begin(115200);
-  
-  // Hardware Serial2 configuration for Raspberry Pi connection
-  // ESP32 Pins: RX2 = GPIO 16, TX2 = GPIO 17
-  Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
   appendLog("System Booting Up...");
 
@@ -147,26 +216,25 @@ void setup() {
   appendLog("Soft-AP Started. SSID: " + String(ssid));
   appendLog("Static Web Server Live at http://192.168.4.17");
 
-  // Web Server Routing paths
   server.on("/", handleRoot);
-  server.on("/getLogs", handleGetLogs);
+  server.on("/getStatus", handleGetStatus);
   server.begin();
 }
 
 void loop() {
   server.handleClient();
 
-  // Ab Serial2 ki jagah direct Serial (USB) se read karenge
+  // Read incoming USB commands from Raspberry Pi
   if (Serial.available() > 0) {
     String incomingCmd = Serial.readStringUntil('\n');
     incomingCmd.trim();
-    
+
     if (incomingCmd.length() > 0) {
       appendLog("USB Rx: Received command -> '" + incomingCmd + "'");
       executeCommand(incomingCmd);
-      
-      // Pi ko wapas confirmation bhejne ke liye bhi direct Serial use hoga
-      Serial.println("ACK_" + incomingCmd); 
+
+      // ACK Back to Pi
+      Serial.println("ACK_" + incomingCmd);
     }
   }
 }
