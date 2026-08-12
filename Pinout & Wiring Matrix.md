@@ -38,5 +38,9 @@
 | **Digital Pin 7 (DIR_EN)**     | **GPIO 17** | Shift Register Output Enable |
 | **Digital Pin 8 (DIR_SER)**    | **GPIO 5**  | Shift Register Data          |
 | **Digital Pin 12 (DIR_LATCH)** | **GPIO 18** | Shift Register Latch         |
-| **Digital Pin 11 (PWM_L)**     | **GPIO 19** | Left Motor Speed             |
-| **Digital Pin 3 (PWM_R)**      | **GPIO 23** | Right Motor Speed            |
+| **Digital Pin 11 (PWM_M1)**    | **GPIO 19** | Motor 1 Speed (Left)         |
+| **Digital Pin 3 (PWM_M2)**     | **GPIO 23** | Motor 2 Speed (Left)         |
+| **Digital Pin 5 (PWM_M3)**     | **GPIO 25** | Motor 3 Speed (Right)        |
+| **Digital Pin 6 (PWM_M4)**     | **GPIO 26** | Motor 4 Speed (Right)        |
+| **GND**                        | **GND**     | Common Ground                |
+| **5V**                         | **VIN (5V)**| 5V Logic Power               |

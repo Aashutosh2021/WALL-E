@@ -12,6 +12,30 @@ IPAddress subnet(255, 255, 255, 0);
 
 WebServer server(80);
 
+// --- L293D Motor Shield Shift Register Pins ---
+// 74HC595 shift register controls motor direction on the L293D shield
+#define DIR_CLK    16   // Shift Register Clock (Digital Pin 4 on shield)
+#define DIR_EN     17   // Shift Register Output Enable (Digital Pin 7)
+#define DIR_SER     5   // Shift Register Data (Digital Pin 8)
+#define DIR_LATCH  18   // Shift Register Latch (Digital Pin 12)
+
+// PWM Pins for motor speed (All 4 motors)
+#define PWM_M1     19   // M1 PWM (D11)
+#define PWM_M2     23   // M2 PWM (D3)
+#define PWM_M3     25   // M3 PWM (D5)
+#define PWM_M4     26   // M4 PWM (D6)
+
+// PWM config
+#define PWM_FREQ   1000
+#define PWM_RES    8     // 8-bit resolution (0-255)
+
+#define MOTOR_SPEED 200  // Default speed (0-255)
+#define MOTOR_RUN_MS 3000 // Auto-stop after 3 seconds
+
+// Motor auto-stop timer
+unsigned long motorStartTime = 0;
+bool motorRunning = false;
+
 // --- System State & Circular Buffer for Logs ---
 String currentEyeState = "IDLE"; // Track current visual eye state
 const int MAX_LOGS = 30;
@@ -132,7 +156,7 @@ void handleRoot() {
   html += "</script>";
 
   html += "</head><body><div class='container'>";
-  html += "<h2>🤖 WALL-E AI Companion Screen Preview</h2>";
+  html += "<h2>WALL-E AI Companion Screen Preview</h2>";
 
   // OLED Visor Screen Markup
   html += "<div id='visor' class='visor-box state-IDLE'>";
@@ -175,29 +199,121 @@ void handleGetStatus() {
   server.send(200, "text/plain", response);
 }
 
+// --- 74HC595 Shift Register Driver ---
+void shiftWrite(uint8_t data) {
+  // Latch LOW to start shifting
+  digitalWrite(DIR_LATCH, LOW);
+  
+  // Use built-in shiftOut for reliable timing
+  shiftOut(DIR_SER, DIR_CLK, MSBFIRST, data);
+  
+  // Latch HIGH to push data to output pins
+  digitalWrite(DIR_LATCH, HIGH);
+}
+
+/*
+ * Adafruit L293D Motor Shield v1 — Shift Register Bit Mapping (from Motortest.ino):
+ * 
+ * M1_A = 2, M1_B = 3
+ * M2_A = 1, M2_B = 4
+ * M3_A = 5, M3_B = 7
+ * M4_A = 0, M4_B = 6
+ * 
+ * Left side: M1 & M2. Right side: M3 & M4
+ * 
+ * FORWARD: M1_B, M2_B, M3_B, M4_B -> bits 3,4,6,7 -> 0b11011000 = 0xD8
+ * BACKWARD: M1_A, M2_A, M3_A, M4_A -> bits 0,1,2,5 -> 0b00100111 = 0x27
+ * LEFT: M1_A, M2_A (back), M3_B, M4_B (fwd) -> bits 1,2,6,7 -> 0b11000110 = 0xC6
+ * RIGHT: M1_B, M2_B (fwd), M3_A, M4_A (back) -> bits 0,3,4,5 -> 0b00111001 = 0x39
+ */
+
+void setMotorSpeeds(int speed) {
+  ledcWrite(PWM_M1, speed);
+  ledcWrite(PWM_M2, speed);
+  ledcWrite(PWM_M3, speed);
+  ledcWrite(PWM_M4, speed);
+}
+
+void motorForward() {
+  shiftWrite(0xD8);
+  setMotorSpeeds(MOTOR_SPEED);
+  motorStartTime = millis();
+  motorRunning = true;
+  appendLog("Motor: FORWARD (3s)");
+}
+
+void motorBackward() {
+  shiftWrite(0x27);
+  setMotorSpeeds(MOTOR_SPEED);
+  motorStartTime = millis();
+  motorRunning = true;
+  appendLog("Motor: BACKWARD (3s)");
+}
+
+void motorLeft() {
+  shiftWrite(0xC6);
+  setMotorSpeeds(MOTOR_SPEED);
+  motorStartTime = millis();
+  motorRunning = true;
+  appendLog("Motor: LEFT turn (3s)");
+}
+
+void motorRight() {
+  shiftWrite(0x39);
+  setMotorSpeeds(MOTOR_SPEED);
+  motorStartTime = millis();
+  motorRunning = true;
+  appendLog("Motor: RIGHT turn (3s)");
+}
+
+void motorStop() {
+  shiftWrite(0x00);
+  setMotorSpeeds(0);
+  motorRunning = false;
+  appendLog("Motor: STOPPED");
+}
+
 // --- Command Execution & State Switcher ---
 void executeCommand(String cmd) {
   cmd.trim();
   if (cmd.length() == 0)
     return;
 
-  // Update Eye State Variable
+  // --- Motor Commands ---
+  if (cmd == "FORWARD") {
+    motorForward();
+    return;
+  } else if (cmd == "BACKWARD") {
+    motorBackward();
+    return;
+  } else if (cmd == "LEFT") {
+    motorLeft();
+    return;
+  } else if (cmd == "RIGHT") {
+    motorRight();
+    return;
+  } else if (cmd == "STOP") {
+    motorStop();
+    return;
+  }
+
+  // --- Eye State Commands ---
   if (cmd == "EYES_TALKING" || cmd == "SPEAK") {
     currentEyeState = "EYES_TALKING";
   } else if (cmd == "EYES_NORMAL" || cmd == "IDLE") {
     currentEyeState = "IDLE";
+  } else if (cmd == "EYES_THINKING" || cmd == "THINK") {
+    currentEyeState = "THINK";
   } else if (cmd == "LISTEN") {
     currentEyeState = "LISTEN";
-  } else if (cmd == "THINK") {
-    currentEyeState = "THINK";
   } else if (cmd == "HAPPY") {
     currentEyeState = "HAPPY";
   } else if (cmd == "ANGRY") {
     currentEyeState = "ANGRY";
   } else if (cmd == "SAD") {
     currentEyeState = "SAD";
-  } else if (cmd == "STOP") {
-    currentEyeState = "STOP";
+  } else if (cmd == "BOOT") {
+    currentEyeState = "IDLE";
   }
 
   appendLog("Executed: Eye Display -> Switched state to " + cmd);
@@ -208,6 +324,27 @@ void setup() {
   Serial.begin(115200);
 
   appendLog("System Booting Up...");
+
+  // --- Initialize L293D Motor Shield Shift Register Pins ---
+  pinMode(DIR_CLK, OUTPUT);
+  pinMode(DIR_EN, OUTPUT);
+  pinMode(DIR_SER, OUTPUT);
+  pinMode(DIR_LATCH, OUTPUT);
+
+  // Enable shift register outputs (active LOW)
+  digitalWrite(DIR_EN, LOW);
+
+  // Clear shift register — all motors off
+  shiftWrite(0x00);
+
+  // --- Initialize PWM for motor speed (ESP32 Arduino Core v3.x API) ---
+  ledcAttach(PWM_M1, PWM_FREQ, PWM_RES);
+  ledcAttach(PWM_M2, PWM_FREQ, PWM_RES);
+  ledcAttach(PWM_M3, PWM_FREQ, PWM_RES);
+  ledcAttach(PWM_M4, PWM_FREQ, PWM_RES);
+  setMotorSpeeds(0);
+
+  appendLog("Motor Shield initialized (Shift Register + PWM)");
 
   // Setup Soft Access Point
   WiFi.softAPConfig(local_IP, gateway, subnet);
@@ -223,6 +360,11 @@ void setup() {
 
 void loop() {
   server.handleClient();
+
+  // --- Auto-stop motor after 3 seconds ---
+  if (motorRunning && (millis() - motorStartTime >= MOTOR_RUN_MS)) {
+    motorStop();
+  }
 
   // Read incoming USB commands from Raspberry Pi
   if (Serial.available() > 0) {

@@ -15,7 +15,7 @@ import shutil
 import numpy as np
 import sounddevice as sd
 import websockets
-import aiohttp, cv2, time as _time
+import aiohttp
 from datetime import datetime
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -100,6 +100,7 @@ class _CameraManager:
 
     def _grab_opencv(self) -> bytes | None:
         try:
+            import cv2
             if self._cv_cap is None or not self._cv_cap.isOpened():
                 self._cv_cap = cv2.VideoCapture(0)
                 if not self._cv_cap.isOpened():

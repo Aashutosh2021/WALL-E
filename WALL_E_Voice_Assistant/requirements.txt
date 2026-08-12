@@ -3,27 +3,20 @@
 # =============================================
 
 # Core: Gemini Live WebSocket connection
-websockets==16.1.1
+websockets
 
 # Audio: Microphone input & speaker output
-sounddevice==0.5.5
-numpy==2.5.2
+sounddevice
+numpy
 
-# Camera: OpenCV for vision capture
-opencv-python==5.0.0.93
+# Camera: OpenCV for vision capture (USB/Windows fallback)
+opencv-python
 
-# HTTP: Weather, web search, geocoding APIs
-aiohttp==3.14.3
+# HTTP: Weather, web search APIs
+aiohttp
 
-# Gemini Vision API (used in tools.py see_object)
-google-genai==2.17.0
-
-# Hardware: UART serial communication with ESP32
-pyserial==3.5
+# Hardware: USB serial communication with ESP32
+pyserial
 
 # Environment variables (.env file loading)
-python-dotenv==1.2.2
-
-# LiveKit mode (only needed if using `python main.py dev`)
-livekit-agents==1.6.9
-livekit-plugins-google==1.6.9
+python-dotenv

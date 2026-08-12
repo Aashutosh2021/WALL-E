@@ -1,20 +1,15 @@
-import os
-from dotenv import load_dotenv
+"""WALL-E System Prompt — Loaded by walle_direct_gemini.py"""
 
-load_dotenv()
+import os
 
 ROBOT_NAME = os.getenv("ROBOT_NAME", "WALL-E")
-
-def get_user_name():
-    user_name = os.getenv("USER_NAME", "Aashutosh").strip()
-    if user_name.startswith('"') and user_name.endswith('"'):
-        user_name = user_name[1:-1]
-    elif user_name.startswith("'") and user_name.endswith("'"):
-        user_name = user_name[1:-1]
-    return user_name or "Aashutosh"
-
-USER_NAME = get_user_name()
 LAN = os.getenv("LAN", "Hindi")
+
+def _get_user_name():
+    name = os.getenv("USER_NAME", "Aashutosh").strip().strip("\"'")
+    return name or "Aashutosh"
+
+USER_NAME = _get_user_name()
 
 AGENT_INSTRUCTION = f"""You are {ROBOT_NAME}, a cute mini AI companion robot built by Aashutosh Kumar.
 Address the user as "{USER_NAME} Sir" or "Sir".
