@@ -18,33 +18,38 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ESP32_PORT = os.getenv("ESP32_PORT", "/dev/ttyUSB0")
 _ESP32_BAUD = 115200
 
+_serial_conn = None
+
 def _probe_usb_serial() -> bool:
-    """Check once at startup if ESP32 USB serial port is accessible."""
+    """Check once at startup and KEEP THE PORT OPEN."""
+    global _serial_conn
     try:
         import serial
-        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.5):
-            pass
-        logger.info(f"USB Serial Port ({_ESP32_PORT}) detected. Motor/Eye control enabled.")
+        # Open port once globally
+        _serial_conn = serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0)
+        # Prevent ESP32 from resetting on connection
+        _serial_conn.setDTR(False)
+        _serial_conn.setRTS(False)
+        logger.info(f"✅ USB Serial Port ({_ESP32_PORT}) opened permanently.")
         return True
-    except Exception:
-        logger.info(f"USB Serial Port ({_ESP32_PORT}) not available. Motor/Eye control disabled.")
+    except Exception as e:
+        logger.info(f"❌ USB Serial Port not available: {e}")
         return False
 
 _USB_AVAILABLE: bool = _probe_usb_serial()
 
-
 def send_uart_command(command: str) -> bool:
-    """Sends command string to ESP32 over USB serial."""
-    if not _USB_AVAILABLE:
+    """Sends command string to ESP32 over ALREADY OPEN USB serial."""
+    global _serial_conn
+    if not _USB_AVAILABLE or not _serial_conn:
         return False
     try:
-        import serial
-        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.1) as s:
-            s.write(f"{command}\n".encode('utf-8'))
-            logger.info(f"✅ USB Command Sent to ESP32: {command}")
+        _serial_conn.write(f"{command}\n".encode('utf-8'))
+        _serial_conn.flush() # Ensure data is pushed immediately
+        logger.info(f"⚡ USB Command Sent: {command}")
         return True
     except Exception as e:
-        logger.error(f"❌ USB Communication Error: {e}")
+        logger.error(f"❌ USB Comm Error: {e}")
         return False
 
 

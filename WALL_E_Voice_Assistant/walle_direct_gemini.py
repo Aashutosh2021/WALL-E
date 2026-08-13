@@ -255,23 +255,36 @@ def _open_speaker_stream():
 # ---------------------------------------------------------------------------
 MIC_CHUNK = 1024  # 64ms at 16kHz — half the old 128ms for faster voice detection
 
+# Noise Gate Threshold: Agar mic volume isse kam hai, toh audio send mat karo
+# Ise apne room noise ke hisab se 100 se 500 ke beech adjust kar lena
+SILENCE_THRESHOLD = 300 
+
 async def send_audio_loop(ws, mic_stream):
-    """Streams recorded microphone PCM audio chunks over WebSocket."""
+    """Streams recorded microphone PCM audio with RMS Noise Gating."""
     global _last_user_audio_ts
-    logger.info("🎤 Mic streaming active (64ms chunks)...")
+    logger.info("🎤 Mic streaming active (Noise Gate ON)...")
     loop = asyncio.get_running_loop()
 
     while True:
         try:
             data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
             if data and not is_ai_speaking:
-                _last_user_audio_ts = _time.monotonic()
-                b64 = base64.b64encode(bytes(data)).decode("utf-8")
-                await ws.send(_dumps({
-                    "realtimeInput": {
-                        "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
-                    }
-                }))
+                
+                # Math: Calculate volume (Root Mean Square) of the chunk
+                audio_np = np.frombuffer(bytes(data), dtype=np.int16)
+                rms = np.sqrt(np.mean(np.square(audio_np.astype(np.float32))))
+                
+                # Agar awaz threshold se badi hai tabhi bhejenge
+                if rms > SILENCE_THRESHOLD:
+                    _last_user_audio_ts = _time.monotonic()
+                    b64 = base64.b64encode(bytes(data)).decode("utf-8")
+                    await ws.send(_dumps({
+                        "realtimeInput": {
+                            "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
+                        }
+                    }))
+                # Agar chuupi (silence) hai, toh frame DROP ho jayega aur Gemini jaldi reply dega.
+                
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -282,39 +295,36 @@ async def send_audio_loop(ws, mic_stream):
 # Vision — Separate REST API call (not through the WebSocket)
 # ---------------------------------------------------------------------------
 async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Analyze image via Ollama Cloud / REST API.
-
-    Returns a text description that gets put into the toolResponse.
-    Uses Ollama's /api/generate endpoint format.
-    """
-    url = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/") + "/api/generate"
-    ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
-    model = os.getenv("OLLAMA_VISION_MODEL", "gemma4:31b") # Or your specific gemma model name
-
+    """Analyze image using Ultra-Fast Gemini Flash REST API (Takes ~1.5s)"""
+    # Use Gemini Flash for blazing fast vision
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
     base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
+    
     payload = {
-        "model": model,
-        "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
-        "images": [base64_img],
-        "stream": False
+        "contents": [{
+            "parts": [
+                {"text": f"Briefly describe what you see (2 short sentences). Focus on: {prompt}"},
+                {"inline_data": {"mime_type": "image/jpeg", "data": base64_img}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.4} # Low temp for fast, factual response
     }
-
+    
     headers = {"Content-Type": "application/json"}
-    if ollama_api_key:
-        headers["Authorization"] = f"Bearer {ollama_api_key}"
-
+    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            # Shortened timeout to 5 seconds
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get("response", "I looked, but couldn't recognize anything.")
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
                 else:
                     err = await resp.text()
-                    logger.warning(f"Ollama Vision API error {resp.status}: {err[:200]}")
+                    logger.warning(f"Gemini Vision API error: {err[:200]}")
                     return "Could not analyze the image right now."
     except Exception as e:
-        logger.warning(f"Ollama Vision API call failed: {e}")
+        logger.warning(f"Vision API network error: {e}")
         return "Image analysis failed due to a network error."
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
