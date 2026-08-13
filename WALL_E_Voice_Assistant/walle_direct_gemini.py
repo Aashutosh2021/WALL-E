@@ -353,15 +353,22 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — inject image FIRST, then toolResponse
+                    # 📸 Camera Vision — realtimeInput + yield + toolResponse
                     #
-                    # WHY THIS ORDER MATTERS:
-                    # If we send toolResponse first, Gemini starts generating
-                    # IMMEDIATELY — using whatever old image is in its history.
-                    # By sending clientContent (turnComplete=false) FIRST, the
-                    # image enters Gemini's context SILENTLY (no response yet).
-                    # Then when toolResponse arrives, Gemini generates ONE
-                    # response with the fresh image already in context.
+                    # WHY realtimeInput (NOT clientContent):
+                    # clientContent creates permanent conversation turns. The
+                    # image persists in history, so on the next "look" request
+                    # Gemini sees the old image in history and responds to it
+                    # directly WITHOUT calling see_object again.
+                    # realtimeInput is stateless — image goes into the live
+                    # media buffer, doesn't pollute conversation history, and
+                    # Gemini will call see_object fresh each time.
+                    #
+                    # WHY the 0.3s yield:
+                    # realtimeInput is processed asynchronously on the server.
+                    # Without a brief yield, the toolResponse arrives before
+                    # the image frame is ingested, causing Gemini to describe
+                    # whatever old frame is in its buffer.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
@@ -383,42 +390,30 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
+                            # STEP 1: Inject image into Gemini's live media buffer
                             base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-
-                            # STEP 1: Inject image into context SILENTLY
-                            # turnComplete=false → Gemini ingests but does NOT
-                            # start generating a response yet
                             await ws.send(_dumps({
-                                "clientContent": {
-                                    "turns": [{
-                                        "role": "user",
-                                        "parts": [
-                                            {
-                                                "inlineData": {
-                                                    "mimeType": "image/jpeg",
-                                                    "data": base64_img
-                                                }
-                                            },
-                                            {
-                                                "text": prompt_text
-                                            }
-                                        ]
-                                    }],
-                                    "turnComplete": False
+                                "realtimeInput": {
+                                    "mediaChunks": [
+                                        {"mimeType": "image/jpeg", "data": base64_img}
+                                    ]
                                 }
                             }))
 
-                            # STEP 2: Complete the tool call — NOW Gemini
-                            # generates one response with the fresh image
+                            # STEP 2: Yield to let server ingest the frame
+                            await asyncio.sleep(0.3)
+
+                            # STEP 3: Complete the tool call — server now has
+                            # the fresh frame, so the response describes it
                             await ws.send(_dumps({
                                 "toolResponse": {
                                     "functionResponses": [{
-                                        "response": {"output": "Photo captured. Analyze the image just provided."},
+                                        "response": {"output": f"Photo captured just now. {prompt_text}"},
                                         "id": call_id
                                     }]
                                 }
                             }))
-                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — clientContent→toolResponse")
+                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — realtimeInput→300ms→toolResponse")
                             continue
                         else:
                             tool_result = "Failed to capture photo from camera."
