@@ -282,40 +282,39 @@ async def send_audio_loop(ws, mic_stream):
 # Vision — Separate REST API call (not through the WebSocket)
 # ---------------------------------------------------------------------------
 async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Analyze image via Gemini REST API (separate from the streaming WebSocket).
+    """Analyze image via Ollama Cloud / REST API.
 
     Returns a text description that gets put into the toolResponse.
-    This avoids ALL protocol conflicts:
-    - No clientContent (which causes infinite tool-call loops)
-    - No realtimeInput (which causes 1007 audio content-type errors)
+    Uses Ollama's /api/generate endpoint format.
     """
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/"
-        "models/gemini-2.5-flash:generateContent"
-        f"?key={api_key}"
-    )
+    url = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/") + "/api/generate"
+    ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
+    model = os.getenv("OLLAMA_VISION_MODEL", "gemma4:31b") # Or your specific gemma model name
+
     base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
     payload = {
-        "contents": [{
-            "parts": [
-                {"inlineData": {"mimeType": "image/jpeg", "data": base64_img}},
-                {"text": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}"}
-            ]
-        }],
-        "generationConfig": {"maxOutputTokens": 200}
+        "model": model,
+        "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
+        "images": [base64_img],
+        "stream": False
     }
+
+    headers = {"Content-Type": "application/json"}
+    if ollama_api_key:
+        headers["Authorization"] = f"Bearer {ollama_api_key}"
+
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                    return data.get("response", "I looked, but couldn't recognize anything.")
                 else:
                     err = await resp.text()
-                    logger.warning(f"Vision API error {resp.status}: {err[:200]}")
+                    logger.warning(f"Ollama Vision API error {resp.status}: {err[:200]}")
                     return "Could not analyze the image right now."
     except Exception as e:
-        logger.warning(f"Vision API call failed: {e}")
+        logger.warning(f"Ollama Vision API call failed: {e}")
         return "Image analysis failed due to a network error."
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
