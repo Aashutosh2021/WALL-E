@@ -353,9 +353,11 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — image FIRST, then toolResponse
-                    # Sending image before toolResponse ensures Gemini has the
-                    # new frame in context BEFORE it starts composing a reply.
+                    # 📸 Camera Vision — uses clientContent (NOT realtimeInput)
+                    # realtimeInput accumulates images in a streaming buffer so
+                    # old frames persist in context → stale descriptions.
+                    # clientContent sends the image as a discrete conversation
+                    # turn, ensuring Gemini responds to THIS image only.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
@@ -373,32 +375,44 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                                     ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
                                     if ok:
                                         b64_thumb = base64.b64encode(buf.tobytes()).decode('utf-8')
-                                        # Send over UART in background so it doesn't block Gemini pipeline
                                         loop.run_in_executor(None, send_uart_command, f"IMG:{b64_thumb}")
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
-                            # STEP 1: Inject the NEW image FIRST
-                            base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-                            await ws.send(_dumps({
-                                "realtimeInput": {
-                                    "mediaChunks": [
-                                        {"mimeType": "image/jpeg", "data": base64_img}
-                                    ]
-                                }
-                            }))
-                            logger.info(f"✅ Photo injected ({len(jpeg_bytes)}B)")
-
-                            # STEP 2: Now complete the tool call — Gemini already
-                            # has the fresh image, so its response will describe it
+                            # STEP 1: Complete the tool call (protocol requirement)
                             await ws.send(_dumps({
                                 "toolResponse": {
                                     "functionResponses": [{
-                                        "response": {"output": f"Photo captured. Describe ONLY this latest image. {prompt_text}"},
+                                        "response": {"output": "Photo captured successfully."},
                                         "id": call_id
                                     }]
                                 }
                             }))
+
+                            # STEP 2: Send image as an explicit user turn via
+                            # clientContent — each image is a fresh conversation
+                            # message, NOT a frame in a streaming buffer.
+                            base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
+                            await ws.send(_dumps({
+                                "clientContent": {
+                                    "turns": [{
+                                        "role": "user",
+                                        "parts": [
+                                            {
+                                                "inlineData": {
+                                                    "mimeType": "image/jpeg",
+                                                    "data": base64_img
+                                                }
+                                            },
+                                            {
+                                                "text": prompt_text
+                                            }
+                                        ]
+                                    }],
+                                    "turnComplete": True
+                                }
+                            }))
+                            logger.info(f"✅ Photo sent via clientContent ({len(jpeg_bytes)}B)")
                             continue  # skip the generic toolResponse below — already sent
                         else:
                             tool_result = "Failed to capture photo from camera."
