@@ -353,22 +353,17 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — realtimeInput + yield + toolResponse
+                    # 📸 Camera Vision — clientContent (NOT realtimeInput)
                     #
-                    # WHY realtimeInput (NOT clientContent):
-                    # clientContent creates permanent conversation turns. The
-                    # image persists in history, so on the next "look" request
-                    # Gemini sees the old image in history and responds to it
-                    # directly WITHOUT calling see_object again.
-                    # realtimeInput is stateless — image goes into the live
-                    # media buffer, doesn't pollute conversation history, and
-                    # Gemini will call see_object fresh each time.
+                    # WHY NOT realtimeInput:
+                    # The native-audio model cannot process image/jpeg via
+                    # realtimeInput.mediaChunks — it corrupts the content
+                    # type state and causes 1007 WebSocket disconnects.
                     #
-                    # WHY the 0.3s yield:
-                    # realtimeInput is processed asynchronously on the server.
-                    # Without a brief yield, the toolResponse arrives before
-                    # the image frame is ingested, causing Gemini to describe
-                    # whatever old frame is in its buffer.
+                    # WHY clientContent:
+                    # clientContent sends the image as a conversation turn
+                    # that the model CAN process for vision analysis.
+                    # The tool description forces fresh tool calls each time.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
@@ -390,30 +385,42 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
-                            # STEP 1: Inject image into Gemini's live media buffer
                             base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-                            await ws.send(_dumps({
-                                "realtimeInput": {
-                                    "mediaChunks": [
-                                        {"mimeType": "image/jpeg", "data": base64_img}
-                                    ]
-                                }
-                            }))
 
-                            # STEP 2: Yield to let server ingest the frame
-                            await asyncio.sleep(0.3)
-
-                            # STEP 3: Complete the tool call — server now has
-                            # the fresh frame, so the response describes it
+                            # STEP 1: Complete tool call with instruction to
+                            # wait for the image — prevents Gemini from
+                            # describing any old image in conversation history
                             await ws.send(_dumps({
                                 "toolResponse": {
                                     "functionResponses": [{
-                                        "response": {"output": f"Photo captured just now. {prompt_text}"},
+                                        "response": {"output": "Photo captured. The image is arriving now — do NOT describe any previous image. Wait for the new photo."},
                                         "id": call_id
                                     }]
                                 }
                             }))
-                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — realtimeInput→300ms→toolResponse")
+
+                            # STEP 2: Send image as a user turn — this is the
+                            # ONLY way to get vision with native-audio models
+                            await ws.send(_dumps({
+                                "clientContent": {
+                                    "turns": [{
+                                        "role": "user",
+                                        "parts": [
+                                            {
+                                                "inlineData": {
+                                                    "mimeType": "image/jpeg",
+                                                    "data": base64_img
+                                                }
+                                            },
+                                            {
+                                                "text": prompt_text
+                                            }
+                                        ]
+                                    }],
+                                    "turnComplete": True
+                                }
+                            }))
+                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — toolResponse→clientContent")
                             continue
                         else:
                             tool_result = "Failed to capture photo from camera."
@@ -519,11 +526,11 @@ async def run_direct_gemini_robot():
                         },
                         {
                             "name": "see_object",
-                            "description": "Captures a frame from camera and sees what is in front of WALL-E.",
+                            "description": "Captures a LIVE photo from camera to see what is currently in front of WALL-E. IMPORTANT: You MUST call this tool EVERY time the user asks to look, see, or describe surroundings. Previous images in conversation are STALE — always capture a fresh photo. Never describe old images.",
                             "parameters": {
                                 "type": "OBJECT",
                                 "properties": {
-                                    "prompt": {"type": "STRING"}
+                                    "prompt": {"type": "STRING", "description": "What to analyze in the image"}
                                 }
                             }
                         },

@@ -19,6 +19,7 @@ RULES:
 - MAXIMUM 1-3 SHORT sentences per response. Be extremely concise.
 - Use remember_fact tool to auto-save any important user detail (preferences, reminders, names, dates).
 - Never ask "should I remember this?" — just save it.
+- VISION: When asked to look/see/describe surroundings, ALWAYS call see_object tool. NEVER describe images from conversation history — they are stale. Always get a fresh capture.
 
 TOOLS: move_robot, see_object, get_weather, get_time_info, search_web, remember_fact.
 
