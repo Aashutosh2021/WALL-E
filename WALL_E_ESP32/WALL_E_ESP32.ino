@@ -38,6 +38,7 @@ bool motorRunning = false;
 
 // --- System State & Circular Buffer for Logs ---
 String currentEyeState = "IDLE"; // Track current visual eye state
+String currentImageB64 = ""; // Base64 thumbnail string for web UI
 const int MAX_LOGS = 30;
 String logBuffer[MAX_LOGS];
 int logIndex = 0;
@@ -133,19 +134,28 @@ void handleRoot() {
   html += "  xhttp.onreadystatechange = function() {";
   html += "    if (this.readyState == 4 && this.status == 200) {";
   html += "      var parts = this.responseText.split('|||');";
-  html += "      var state = parts[0].trim();";
-  html += "      var logsHtml = parts[1];";
+  html += "      var state = parts[0] ? parts[0].trim() : 'IDLE';";
+  html += "      var logsHtml = parts.length > 1 ? parts[1] : '';";
+  html += "      var imgB64 = parts.length > 2 ? parts[2].trim() : '';";
 
   // Update Eye Screen CSS Class dynamically
   html += "      var visor = document.getElementById('visor');";
   html += "      visor.className = 'visor-box state-' + state;";
-  html += "      document.getElementById('state-text').innerText = 'STATE: ' + "
-          "state;";
+  html += "      document.getElementById('state-text').innerText = 'STATE: ' + state;";
+
+  // Update Camera Preview Image
+  html += "      var imgContainer = document.getElementById('camera-preview');";
+  html += "      if (imgB64.length > 0) {";
+  html += "        imgContainer.innerHTML = \"<img src='data:image/jpeg;base64,\" + imgB64 + \"' style='width:160px; height:120px; border-radius:10px; border:2px solid #00d2ff; box-shadow: 0 0 15px rgba(0, 210, 255, 0.5);'>\";";
+  html += "        imgContainer.style.display = 'block';";
+  html += "      } else {";
+  html += "        imgContainer.style.display = 'none';";
+  html += "        imgContainer.innerHTML = '';";
+  html += "      }";
 
   // Update Console Logs
   html += "      var el = document.getElementById('console');";
-  html += "      var isScrolledToBottom = el.scrollHeight - el.clientHeight <= "
-          "el.scrollTop + 2;";
+  html += "      var isScrolledToBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 2;";
   html += "      el.innerHTML = logsHtml;";
   html += "      if(isScrolledToBottom) { el.scrollTop = el.scrollHeight; }";
   html += "    }";
@@ -166,6 +176,9 @@ void handleRoot() {
   html += "  </div>";
   html += "  <div id='state-text' class='eye-status-tag'>STATE: IDLE</div>";
   html += "</div>";
+
+  // Camera Preview Container (Hidden by default)
+  html += "<div id='camera-preview' style='display:none; text-align:center; margin-bottom:15px;'></div>";
 
   // Terminal Console Markup
   html += "<div id='console'>Initializing Console...</div>";
@@ -194,8 +207,8 @@ void handleGetStatus() {
     }
   }
 
-  // Send Delimiter separated string: STATE|||LOGS
-  String response = currentEyeState + "|||" + logsHtml;
+  // Send Delimiter separated string: STATE|||LOGS|||IMAGE
+  String response = currentEyeState + "|||" + logsHtml + "|||" + currentImageB64;
   server.send(200, "text/plain", response);
 }
 
@@ -297,6 +310,16 @@ void executeCommand(String cmd) {
     return;
   }
 
+  // --- Image Commands ---
+  if (cmd.startsWith("IMG:")) {
+    currentImageB64 = cmd.substring(4); // Remove "IMG:"
+    // Do not append this large string to the logs
+    return;
+  } else if (cmd == "IMG_CLEAR") {
+    currentImageB64 = "";
+    return;
+  }
+
   // --- Eye State Commands ---
   if (cmd == "EYES_TALKING" || cmd == "SPEAK") {
     currentEyeState = "EYES_TALKING";
@@ -322,6 +345,9 @@ void executeCommand(String cmd) {
 void setup() {
   // Serial0 (USB to Raspberry Pi)
   Serial.begin(115200);
+  
+  // Increase RX buffer size to handle large base64 image strings safely
+  Serial.setRxBufferSize(4096);
 
   appendLog("System Booting Up...");
 

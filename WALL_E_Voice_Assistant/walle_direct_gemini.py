@@ -16,6 +16,7 @@ import numpy as np
 import sounddevice as sd
 import websockets
 import aiohttp
+import time as _time
 from datetime import datetime
 
 # Fast JSON for the hot WebSocket path (falls back to stdlib json if orjson missing)
@@ -43,10 +44,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 from prompts import AGENT_INSTRUCTION
-from tools import send_uart_command
+from tools import send_uart_command, TOOL_MAP
 
 # Flag to control mic feedback while AI is speaking
 is_ai_speaking = False
+
+# Latency tracking
+_last_user_audio_ts = 0.0   # timestamp of last mic chunk sent
+_first_ai_audio_ts = 0.0    # timestamp of first AI audio byte received in current turn
+_ai_turn_started = False     # whether we've logged the first-byte latency for this turn
 
 # ---------------------------------------------------------------------------
 # Multi-Strategy Camera — picamera2 (persistent, warm) → rpicam-still →
@@ -108,12 +114,16 @@ class _CameraManager:
     def _grab_picam2(self) -> bytes | None:
         try:
             import cv2
-            frame = self._picam2.capture_array("main")  # sensor already warm — no init delay
+            # Flush stale buffered frames — capture_array can return old data
+            # from the internal ring buffer. Drop 2 frames to guarantee freshness.
+            for _ in range(2):
+                self._picam2.capture_array("main")
+            frame = self._picam2.capture_array("main")
             ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
             if not ok:
                 return None
             jpeg_bytes = buf.tobytes()
-            logger.info(f"📸 picamera2 captured {len(jpeg_bytes)}B (no subprocess spawn)")
+            logger.info(f"📸 picamera2 captured {len(jpeg_bytes)}B (fresh frame, 2 stale dropped)")
             return jpeg_bytes
         except Exception as e:
             logger.error(f"picamera2 capture error: {e}")
@@ -163,7 +173,9 @@ class _CameraManager:
                 self._cv_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
                 self._cv_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
                 self._cv_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._cv_cap.grab()  # flush stale frame
+            self._cv_cap.grab()  # flush stale frame 1
+            self._cv_cap.grab()  # flush stale frame 2
+            self._cv_cap.grab()  # flush stale frame 3
             ret, frame = self._cv_cap.read()
             if not ret or frame is None:
                 return None
@@ -190,109 +202,8 @@ class _CameraManager:
 
 _camera = _CameraManager()
 # ---------------------------------------------------------------------------
-# Hardware & Software Tools
+# State tracking for eye animation
 # ---------------------------------------------------------------------------
-async def _move_robot(direction: str) -> str:
-    """Controls WALL-E movement via UART."""
-    dir_upper = direction.upper().strip()
-    valid = ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]
-    if dir_upper not in valid:
-        return f"Invalid direction '{direction}'. Use: FORWARD, BACKWARD, LEFT, RIGHT, STOP."
-    send_uart_command(dir_upper)
-    return f"WALL-E moving {dir_upper}." if dir_upper != "STOP" else "WALL-E stopped."
-
-_http_session: aiohttp.ClientSession | None = None
-
-async def _get_session() -> aiohttp.ClientSession:
-    """Reuses one aiohttp session across calls — skips repeated TLS/connect handshake."""
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
-    return _http_session
-
-async def _get_weather(city: str = "Delhi") -> str:
-    """Fetches real-time weather from Open-Meteo."""
-    try:
-        sess = await _get_session()
-        async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            geo = await r.json()
-        if not geo.get("results"):
-            return f"City '{city}' not found."
-        loc = geo["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        name = loc.get("name", city)
-        country = loc.get("country", "")
-        async with sess.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            w = await r.json()
-        curr = w.get("current_weather", {})
-        return f"Weather in {name}, {country}: {curr.get('temperature','N/A')}°C, Wind: {curr.get('windspeed','N/A')} km/h."
-    except Exception as e:
-        return f"Weather error: {e}"
-
-async def _get_time_info() -> str:
-    """Returns current time and date."""
-    now = datetime.now()
-    return f"Time: {now.strftime('%I:%M %p')}, Date: {now.strftime('%d %B %Y')} ({now.strftime('%A')})."
-
-async def _search_web(query: str) -> str:
-    """Lightweight web search via DuckDuckGo / Wikipedia."""
-    try:
-        sess = await _get_session()
-        async with sess.get(f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                data = await r.json(content_type=None)
-                abstract = data.get("AbstractText", "").strip()
-                if abstract:
-                    return f"Search result: {abstract[:300]}"
-        async with sess.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ','_')}", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            if r.status == 200:
-                data = await r.json()
-                extract = data.get("extract", "").strip()
-                if extract:
-                    return f"Wikipedia: {extract[:300]}"
-        return f"No summary found for '{query}'."
-    except Exception as e:
-        return f"Search error: {e}"
-
-async def _remember_fact(fact: str) -> str:
-    """Saves an important fact or reminder to WALL-E's long-term memory."""
-    memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
-    memories = []
-    if os.path.exists(memory_file):
-        try:
-            with open(memory_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    memories = json.loads(content)
-        except Exception as e:
-            logger.error(f"Failed to read memory.json: {e}")
-    
-    new_memory = {
-        "fact": fact,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    memories.append(new_memory)
-    
-    # Cap at 50 memories to prevent file bloat
-    if len(memories) > 50:
-        memories = memories[-50:]
-    
-    try:
-        with open(memory_file, "w", encoding="utf-8") as f:
-            json.dump(memories, f, indent=2)
-        logger.info(f"🧠 Memory saved: {fact}")
-        return f"✅ Memorized: {fact}"
-    except Exception as e:
-        logger.error(f"Failed to write to memory.json: {e}")
-        return f"❌ Failed to memorize: {e}"
-
-TOOL_MAP = {
-    "move_robot": _move_robot,
-    "get_weather": _get_weather,
-    "get_time_info": _get_time_info,
-    "search_web": _search_web,
-    "remember_fact": _remember_fact,
-}
 
 # State track karne ke liye global variable
 _current_eye_state = None
@@ -346,6 +257,7 @@ MIC_CHUNK = 1024  # 64ms at 16kHz — half the old 128ms for faster voice detect
 
 async def send_audio_loop(ws, mic_stream):
     """Streams recorded microphone PCM audio chunks over WebSocket."""
+    global _last_user_audio_ts
     logger.info("🎤 Mic streaming active (64ms chunks)...")
     loop = asyncio.get_running_loop()
 
@@ -353,6 +265,7 @@ async def send_audio_loop(ws, mic_stream):
         try:
             data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
             if data and not is_ai_speaking:
+                _last_user_audio_ts = _time.monotonic()
                 b64 = base64.b64encode(bytes(data)).decode("utf-8")
                 await ws.send(_dumps({
                     "realtimeInput": {
@@ -367,7 +280,7 @@ async def send_audio_loop(ws, mic_stream):
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
     """Receives Gemini Live WebSocket messages (Audio, Camera requests & Tool Calls)."""
-    global is_ai_speaking
+    global is_ai_speaking, _first_ai_audio_ts, _ai_turn_started
     speaker_stream, active_rate = speaker_stream_tuple
     logger.info("🔊 Speaker listener active...")
     loop = asyncio.get_running_loop()
@@ -385,7 +298,9 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
             if server_content:
                 if server_content.get("interrupted"):
                     is_ai_speaking = False
+                    _ai_turn_started = False
                     set_eye_state("EYES_NORMAL")
+                    logger.info("⏹️ AI interrupted by user.")
 
                 model_turn = server_content.get("modelTurn")
                 if model_turn:
@@ -393,6 +308,14 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                     for part in parts:
                         inline_data = part.get("inlineData")
                         if inline_data and inline_data.get("data"):
+                            # Log first-byte latency (user audio → AI audio)
+                            if not _ai_turn_started:
+                                _ai_turn_started = True
+                                _first_ai_audio_ts = _time.monotonic()
+                                if _last_user_audio_ts > 0:
+                                    latency_ms = (_first_ai_audio_ts - _last_user_audio_ts) * 1000
+                                    logger.info(f"⚡ LATENCY: {latency_ms:.0f}ms (last mic chunk → first AI audio)")
+
                             is_ai_speaking = True
                             set_eye_state("EYES_TALKING")
 
@@ -409,8 +332,14 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                                 )
 
                 if server_content.get("turnComplete"):
+                    # Log total AI turn duration
+                    if _ai_turn_started and _first_ai_audio_ts > 0:
+                        turn_duration_ms = (_time.monotonic() - _first_ai_audio_ts) * 1000
+                        logger.info(f"🏁 AI turn complete ({turn_duration_ms:.0f}ms total speech)")
                     is_ai_speaking = False
+                    _ai_turn_started = False
                     set_eye_state("EYES_NORMAL")
+                    await loop.run_in_executor(None, send_uart_command, "IMG_CLEAR")
 
             # Handle Tool Calls
             tool_call = data.get("toolCall")
@@ -424,26 +353,34 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — toolResponse FIRST, then image via realtimeInput
+                    # 📸 Camera Vision — image FIRST, then toolResponse
+                    # Sending image before toolResponse ensures Gemini has the
+                    # new frame in context BEFORE it starts composing a reply.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
 
                         if jpeg_bytes:
-                            # STEP 1: Complete the tool call FIRST (Gemini is waiting)
                             prompt_text = args.get("prompt", "Describe what you see.")
-                            await ws.send(json.dumps({
-                                "toolResponse": {
-                                    "functionResponses": [{
-                                        "response": {"output": f"Photo captured. {prompt_text}"},
-                                        "id": call_id
-                                    }]
-                                }
-                            }))
 
-                            # STEP 2: Inject image via realtimeInput (safe for audio mode)
+                            # --- SEND THUMBNAIL TO ESP32 FOR WEB UI ---
+                            try:
+                                import cv2, numpy as np
+                                arr = np.frombuffer(jpeg_bytes, np.uint8)
+                                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                                if img is not None:
+                                    thumb = cv2.resize(img, (160, 120))
+                                    ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
+                                    if ok:
+                                        b64_thumb = base64.b64encode(buf.tobytes()).decode('utf-8')
+                                        # Send over UART in background so it doesn't block Gemini pipeline
+                                        loop.run_in_executor(None, send_uart_command, f"IMG:{b64_thumb}")
+                            except Exception as e:
+                                logger.warning(f"Failed to send thumbnail to ESP32: {e}")
+
+                            # STEP 1: Inject the NEW image FIRST
                             base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-                            await ws.send(json.dumps({
+                            await ws.send(_dumps({
                                 "realtimeInput": {
                                     "mediaChunks": [
                                         {"mimeType": "image/jpeg", "data": base64_img}
@@ -451,6 +388,17 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                                 }
                             }))
                             logger.info(f"✅ Photo injected ({len(jpeg_bytes)}B)")
+
+                            # STEP 2: Now complete the tool call — Gemini already
+                            # has the fresh image, so its response will describe it
+                            await ws.send(_dumps({
+                                "toolResponse": {
+                                    "functionResponses": [{
+                                        "response": {"output": f"Photo captured. Describe ONLY this latest image. {prompt_text}"},
+                                        "id": call_id
+                                    }]
+                                }
+                            }))
                             continue  # skip the generic toolResponse below — already sent
                         else:
                             tool_result = "Failed to capture photo from camera."
