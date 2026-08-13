@@ -353,11 +353,15 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — uses clientContent (NOT realtimeInput)
-                    # realtimeInput accumulates images in a streaming buffer so
-                    # old frames persist in context → stale descriptions.
-                    # clientContent sends the image as a discrete conversation
-                    # turn, ensuring Gemini responds to THIS image only.
+                    # 📸 Camera Vision — inject image FIRST, then toolResponse
+                    #
+                    # WHY THIS ORDER MATTERS:
+                    # If we send toolResponse first, Gemini starts generating
+                    # IMMEDIATELY — using whatever old image is in its history.
+                    # By sending clientContent (turnComplete=false) FIRST, the
+                    # image enters Gemini's context SILENTLY (no response yet).
+                    # Then when toolResponse arrives, Gemini generates ONE
+                    # response with the fresh image already in context.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
@@ -379,20 +383,11 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
-                            # STEP 1: Complete the tool call (protocol requirement)
-                            await ws.send(_dumps({
-                                "toolResponse": {
-                                    "functionResponses": [{
-                                        "response": {"output": "Photo captured successfully."},
-                                        "id": call_id
-                                    }]
-                                }
-                            }))
-
-                            # STEP 2: Send image as an explicit user turn via
-                            # clientContent — each image is a fresh conversation
-                            # message, NOT a frame in a streaming buffer.
                             base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
+
+                            # STEP 1: Inject image into context SILENTLY
+                            # turnComplete=false → Gemini ingests but does NOT
+                            # start generating a response yet
                             await ws.send(_dumps({
                                 "clientContent": {
                                     "turns": [{
@@ -409,11 +404,22 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                                             }
                                         ]
                                     }],
-                                    "turnComplete": True
+                                    "turnComplete": False
                                 }
                             }))
-                            logger.info(f"✅ Photo sent via clientContent ({len(jpeg_bytes)}B)")
-                            continue  # skip the generic toolResponse below — already sent
+
+                            # STEP 2: Complete the tool call — NOW Gemini
+                            # generates one response with the fresh image
+                            await ws.send(_dumps({
+                                "toolResponse": {
+                                    "functionResponses": [{
+                                        "response": {"output": "Photo captured. Analyze the image just provided."},
+                                        "id": call_id
+                                    }]
+                                }
+                            }))
+                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — clientContent→toolResponse")
+                            continue
                         else:
                             tool_result = "Failed to capture photo from camera."
 
