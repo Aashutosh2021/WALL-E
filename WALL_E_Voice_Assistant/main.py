@@ -14,6 +14,12 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 from dotenv import load_dotenv
 
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass  # falls back to stdlib asyncio loop if uvloop not installed
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",

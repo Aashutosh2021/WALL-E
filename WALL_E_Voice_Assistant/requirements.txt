@@ -20,3 +20,7 @@ pyserial
 
 # Environment variables (.env file loading)
 python-dotenv
+
+# Perf: faster JSON on hot WebSocket path, faster asyncio event loop
+orjson
+uvloop

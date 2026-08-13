@@ -18,6 +18,17 @@ import websockets
 import aiohttp
 from datetime import datetime
 
+# Fast JSON for the hot WebSocket path (falls back to stdlib json if orjson missing)
+try:
+    import orjson
+    def _dumps(obj) -> str:
+        return orjson.dumps(obj).decode()
+    _loads = orjson.loads
+except ImportError:
+    def _dumps(obj) -> str:
+        return json.dumps(obj)
+    _loads = json.loads
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -38,24 +49,53 @@ from tools import send_uart_command
 is_ai_speaking = False
 
 # ---------------------------------------------------------------------------
-# Multi-Strategy Camera — rpicam-still (Pi CSI) → OpenCV (USB/Windows)
+# Multi-Strategy Camera — picamera2 (persistent, warm) → rpicam-still →
+# libcamera-still → OpenCV (USB/Windows)
 # ---------------------------------------------------------------------------
+try:
+    from picamera2 import Picamera2
+    _HAS_PICAM2 = True
+except ImportError:
+    Picamera2 = None
+    _HAS_PICAM2 = False
+
 _HAS_RPICAM = shutil.which("rpicam-still") is not None
 _HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
 
 class _CameraManager:
-    """Captures frames using the best available method for the platform."""
+    """Captures frames. Prefers a persistent picamera2 sensor (opened once, kept
+    warm) — avoids the ~500ms-1s cold-start of spawning rpicam-still per call.
+    Falls back to rpicam-still / libcamera-still subprocess, then OpenCV."""
     def __init__(self):
         self._cv_cap = None
-        if _HAS_RPICAM:
-            logger.info("📷 Camera backend: rpicam-still (Pi CSI)")
-        elif _HAS_LIBCAMERA:
-            logger.info("📷 Camera backend: libcamera-still (Pi CSI legacy)")
-        else:
-            logger.info("📷 Camera backend: OpenCV (USB/Windows)")
+        self._picam2 = None
+
+        if _HAS_PICAM2:
+            try:
+                self._picam2 = Picamera2()
+                config = self._picam2.create_still_configuration(
+                    main={"size": (320, 240), "format": "RGB888"}  # RGB888 = [B,G,R] per-pixel — already OpenCV-ready, no cvtColor needed
+                )
+                self._picam2.configure(config)
+                self._picam2.start()
+                logger.info("📷 Camera backend: picamera2 (persistent, sensor kept warm)")
+            except Exception as e:
+                logger.error(f"picamera2 init failed, falling back to subprocess camera: {e}")
+                self._picam2 = None
+
+        if self._picam2 is None:
+            if _HAS_RPICAM:
+                logger.info("📷 Camera backend: rpicam-still (Pi CSI, cold-start per call)")
+            elif _HAS_LIBCAMERA:
+                logger.info("📷 Camera backend: libcamera-still (Pi CSI legacy, cold-start per call)")
+            else:
+                logger.info("📷 Camera backend: OpenCV (USB/Windows)")
 
     def grab_jpeg(self) -> bytes | None:
         """Grab a single JPEG frame using the best available method."""
+        # Strategy 0: picamera2 — persistent, warm sensor (fastest, no process spawn)
+        if self._picam2 is not None:
+            return self._grab_picam2()
         # Strategy 1: rpicam-still (modern Raspberry Pi OS 64-bit)
         if _HAS_RPICAM:
             return self._grab_rpicam()
@@ -64,6 +104,20 @@ class _CameraManager:
             return self._grab_libcamera()
         # Strategy 3: OpenCV (USB cameras, Windows)
         return self._grab_opencv()
+
+    def _grab_picam2(self) -> bytes | None:
+        try:
+            import cv2
+            frame = self._picam2.capture_array("main")  # sensor already warm — no init delay
+            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+            if not ok:
+                return None
+            jpeg_bytes = buf.tobytes()
+            logger.info(f"📸 picamera2 captured {len(jpeg_bytes)}B (no subprocess spawn)")
+            return jpeg_bytes
+        except Exception as e:
+            logger.error(f"picamera2 capture error: {e}")
+            return None
 
     def _grab_rpicam(self) -> bytes | None:
         try:
@@ -123,13 +177,18 @@ class _CameraManager:
             return None
 
     def close(self):
+        if self._picam2 is not None:
+            try: self._picam2.stop()
+            except: pass
+            try: self._picam2.close()
+            except: pass
+            self._picam2 = None
         if self._cv_cap is not None:
             try: self._cv_cap.release()
             except: pass
             self._cv_cap = None
 
 _camera = _CameraManager()
-
 # ---------------------------------------------------------------------------
 # Hardware & Software Tools
 # ---------------------------------------------------------------------------
@@ -142,22 +201,31 @@ async def _move_robot(direction: str) -> str:
     send_uart_command(dir_upper)
     return f"WALL-E moving {dir_upper}." if dir_upper != "STOP" else "WALL-E stopped."
 
+_http_session: aiohttp.ClientSession | None = None
+
+async def _get_session() -> aiohttp.ClientSession:
+    """Reuses one aiohttp session across calls — skips repeated TLS/connect handshake."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession()
+    return _http_session
+
 async def _get_weather(city: str = "Delhi") -> str:
     """Fetches real-time weather from Open-Meteo."""
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                geo = await r.json()
-            if not geo.get("results"):
-                return f"City '{city}' not found."
-            loc = geo["results"][0]
-            lat, lon = loc["latitude"], loc["longitude"]
-            name = loc.get("name", city)
-            country = loc.get("country", "")
-            async with sess.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                w = await r.json()
-            curr = w.get("current_weather", {})
-            return f"Weather in {name}, {country}: {curr.get('temperature','N/A')}°C, Wind: {curr.get('windspeed','N/A')} km/h."
+        sess = await _get_session()
+        async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
+            geo = await r.json()
+        if not geo.get("results"):
+            return f"City '{city}' not found."
+        loc = geo["results"][0]
+        lat, lon = loc["latitude"], loc["longitude"]
+        name = loc.get("name", city)
+        country = loc.get("country", "")
+        async with sess.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=aiohttp.ClientTimeout(total=5)) as r:
+            w = await r.json()
+        curr = w.get("current_weather", {})
+        return f"Weather in {name}, {country}: {curr.get('temperature','N/A')}°C, Wind: {curr.get('windspeed','N/A')} km/h."
     except Exception as e:
         return f"Weather error: {e}"
 
@@ -169,19 +237,19 @@ async def _get_time_info() -> str:
 async def _search_web(query: str) -> str:
     """Lightweight web search via DuckDuckGo / Wikipedia."""
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status == 200:
-                    data = await r.json(content_type=None)
-                    abstract = data.get("AbstractText", "").strip()
-                    if abstract:
-                        return f"Search result: {abstract[:300]}"
-            async with sess.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ','_')}", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    extract = data.get("extract", "").strip()
-                    if extract:
-                        return f"Wikipedia: {extract[:300]}"
+        sess = await _get_session()
+        async with sess.get(f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1", timeout=aiohttp.ClientTimeout(total=5)) as r:
+            if r.status == 200:
+                data = await r.json(content_type=None)
+                abstract = data.get("AbstractText", "").strip()
+                if abstract:
+                    return f"Search result: {abstract[:300]}"
+        async with sess.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ','_')}", timeout=aiohttp.ClientTimeout(total=5)) as r:
+            if r.status == 200:
+                data = await r.json()
+                extract = data.get("extract", "").strip()
+                if extract:
+                    return f"Wikipedia: {extract[:300]}"
         return f"No summary found for '{query}'."
     except Exception as e:
         return f"Search error: {e}"
@@ -258,8 +326,9 @@ def _resample_24k_to_48k(raw_pcm_bytes: bytes) -> bytes:
     return np.repeat(pcm, 2).tobytes()
 
 def _open_speaker_stream():
-    """Open speaker at highest supported rate. Returns (stream, rate)."""
-    for rate in [48000, 44100, 24000]:
+    """Open speaker at model-native 24kHz first (zero resample). Fallback 48k (cheap 2x resample).
+    44100 dropped on purpose — old code never resampled for it, causing pitched/fast audio."""
+    for rate in [24000, 48000]:
         try:
             stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype='int16')
             stream.start()
@@ -283,10 +352,9 @@ async def send_audio_loop(ws, mic_stream):
     while True:
         try:
             data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
-            if data:
-                raw = b'\x00' * len(data) if is_ai_speaking else bytes(data)
-                b64 = base64.b64encode(raw).decode("utf-8")
-                await ws.send(json.dumps({
+            if data and not is_ai_speaking:
+                b64 = base64.b64encode(bytes(data)).decode("utf-8")
+                await ws.send(_dumps({
                     "realtimeInput": {
                         "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
                     }
@@ -307,7 +375,7 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
     try:
         async for message in ws:
-            data = json.loads(message)
+            data = _loads(message)
 
             if "setupComplete" in data:
                 logger.info("🚀 Gemini Live Handshake Complete! Ready for speech.")
