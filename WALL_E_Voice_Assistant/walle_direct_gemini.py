@@ -278,6 +278,46 @@ async def send_audio_loop(ws, mic_stream):
             logger.warning(f"Mic error: {e}")
             break
 
+# ---------------------------------------------------------------------------
+# Vision — Separate REST API call (not through the WebSocket)
+# ---------------------------------------------------------------------------
+async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
+    """Analyze image via Gemini REST API (separate from the streaming WebSocket).
+
+    Returns a text description that gets put into the toolResponse.
+    This avoids ALL protocol conflicts:
+    - No clientContent (which causes infinite tool-call loops)
+    - No realtimeInput (which causes 1007 audio content-type errors)
+    """
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-flash:generateContent"
+        f"?key={api_key}"
+    )
+    base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": "image/jpeg", "data": base64_img}},
+                {"text": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}"}
+            ]
+        }],
+        "generationConfig": {"maxOutputTokens": 200}
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    err = await resp.text()
+                    logger.warning(f"Vision API error {resp.status}: {err[:200]}")
+                    return "Could not analyze the image right now."
+    except Exception as e:
+        logger.warning(f"Vision API call failed: {e}")
+        return "Image analysis failed due to a network error."
+
 async def receive_messages_loop(ws, speaker_stream_tuple):
     """Receives Gemini Live WebSocket messages (Audio, Camera requests & Tool Calls)."""
     global is_ai_speaking, _first_ai_audio_ts, _ai_turn_started
@@ -353,17 +393,18 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
 
                     logger.info(f"🔧 Tool: {fn_name}({args})")
 
-                    # 📸 Camera Vision — clientContent (NOT realtimeInput)
+                    # 📸 Camera Vision — separate REST API call
                     #
-                    # WHY NOT realtimeInput:
-                    # The native-audio model cannot process image/jpeg via
-                    # realtimeInput.mediaChunks — it corrupts the content
-                    # type state and causes 1007 WebSocket disconnects.
+                    # WHY NOT clientContent or realtimeInput:
+                    # - clientContent creates permanent conversation turns
+                    #   containing the image + "describe" text, causing the
+                    #   model to re-trigger see_object in an infinite loop.
+                    # - realtimeInput corrupts the native-audio model's
+                    #   content type, causing 1007 WebSocket disconnects.
                     #
-                    # WHY clientContent:
-                    # clientContent sends the image as a conversation turn
-                    # that the model CAN process for vision analysis.
-                    # The tool description forces fresh tool calls each time.
+                    # SOLUTION: Use a separate Gemini REST API call to
+                    # analyze the image. Return the TEXT description in the
+                    # toolResponse. Zero protocol conflicts.
                     if fn_name == "see_object":
                         logger.info("📸 Capturing photo...")
                         jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
@@ -385,43 +426,11 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
-                            base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-
-                            # STEP 1: Complete tool call with instruction to
-                            # wait for the image — prevents Gemini from
-                            # describing any old image in conversation history
-                            await ws.send(_dumps({
-                                "toolResponse": {
-                                    "functionResponses": [{
-                                        "response": {"output": "Photo captured. The image is arriving now — do NOT describe any previous image. Wait for the new photo."},
-                                        "id": call_id
-                                    }]
-                                }
-                            }))
-
-                            # STEP 2: Send image as a user turn — this is the
-                            # ONLY way to get vision with native-audio models
-                            await ws.send(_dumps({
-                                "clientContent": {
-                                    "turns": [{
-                                        "role": "user",
-                                        "parts": [
-                                            {
-                                                "inlineData": {
-                                                    "mimeType": "image/jpeg",
-                                                    "data": base64_img
-                                                }
-                                            },
-                                            {
-                                                "text": prompt_text
-                                            }
-                                        ]
-                                    }],
-                                    "turnComplete": True
-                                }
-                            }))
-                            logger.info(f"✅ Photo sent ({len(jpeg_bytes)}B) — toolResponse→clientContent")
-                            continue
+                            # Analyze image via separate REST API call
+                            api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+                            description = await _analyze_image(jpeg_bytes, prompt_text, api_key)
+                            tool_result = description
+                            logger.info(f"✅ Photo analyzed ({len(jpeg_bytes)}B) → {description[:100]}")
                         else:
                             tool_result = "Failed to capture photo from camera."
 
@@ -526,7 +535,7 @@ async def run_direct_gemini_robot():
                         },
                         {
                             "name": "see_object",
-                            "description": "Captures a LIVE photo from camera to see what is currently in front of WALL-E. IMPORTANT: You MUST call this tool EVERY time the user asks to look, see, or describe surroundings. Previous images in conversation are STALE — always capture a fresh photo. Never describe old images.",
+                            "description": "Captures a photo from WALL-E's camera and returns a description of what is visible. Use when user asks to look or see something.",
                             "parameters": {
                                 "type": "OBJECT",
                                 "properties": {
