@@ -38,6 +38,11 @@ load_dotenv(override=True)
 
 from prompts import AGENT_INSTRUCTION
 from tools import send_uart_command, TOOL_MAP, close_uart
+from conversation_memory import (
+    init_db,
+    save_message,
+    format_recent_context,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +74,8 @@ if not any(getattr(h, "_walle_handler", False) for h in root.handlers):
 logger = logging.getLogger("WALLE")
 BASE = os.path.dirname(os.path.abspath(__file__))
 
+# Persistent conversation DB (SQLite/WAL; no extra package required).
+init_db()
 
 MIC_CHUNK = int(os.getenv("MIC_CHUNK", "512"))
 VISION_ENABLED = os.getenv("ENABLE_VISION", "1").lower() in {
@@ -93,6 +100,10 @@ LIVE_MODEL = os.getenv(
 )
 
 SERIAL_PORT_DISPLAY = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "30"))
+SESSION_ID = os.getenv("WALLE_SESSION_ID", "") or time.strftime(
+    "%Y%m%d-%H%M%S"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +712,19 @@ async def handle_other_tool(call):
             result,
         )
 
+        try:
+            await asyncio.to_thread(
+                save_message,
+                "tool",
+                str(result),
+                SESSION_ID,
+                "see_object",
+                json.dumps(args, ensure_ascii=False),
+                str(result),
+            )
+        except Exception as e:
+            logger.warning("💾 MEMORY SAVE VISION FAILED | %s", e)
+
         return result
 
     func = TOOL_MAP.get(name)
@@ -724,6 +748,19 @@ async def handle_other_tool(call):
             name,
             result,
         )
+
+        try:
+            await asyncio.to_thread(
+                save_message,
+                "tool",
+                str(result),
+                SESSION_ID,
+                name,
+                json.dumps(args, ensure_ascii=False),
+                str(result),
+            )
+        except Exception as e:
+            logger.warning("💾 MEMORY SAVE TOOL FAILED | %s", e)
 
         return result
 
@@ -879,6 +916,36 @@ async def receive_loop(ws, speaker_info):
                 if ai_text:
                     log_ai(ai_text)
 
+                # Persist the completed conversational turn.
+                # SQLite WAL keeps this fast and crash-safe enough for Pi use.
+                if user_text:
+                    try:
+                        await asyncio.to_thread(
+                            save_message,
+                            "user",
+                            user_text,
+                            SESSION_ID,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "💾 MEMORY SAVE USER FAILED | %s",
+                            e,
+                        )
+
+                if ai_text:
+                    try:
+                        await asyncio.to_thread(
+                            save_message,
+                            "assistant",
+                            ai_text,
+                            SESSION_ID,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "💾 MEMORY SAVE AI FAILED | %s",
+                            e,
+                        )
+
                 _user_transcript_parts.clear()
                 _ai_transcript_parts.clear()
 
@@ -978,6 +1045,19 @@ async def receive_loop(ws, speaker_info):
             else:
                 result = f"Invalid direction '{d}'."
 
+            try:
+                await asyncio.to_thread(
+                    save_message,
+                    "tool",
+                    str(result),
+                    SESSION_ID,
+                    "move_robot",
+                    json.dumps(args, ensure_ascii=False),
+                    str(result),
+                )
+            except Exception as e:
+                logger.warning("💾 MEMORY SAVE MOVE FAILED | %s", e)
+
             await send_tool_response(
                 ws,
                 cid,
@@ -1035,6 +1115,14 @@ async def run():
 
     except Exception:
         pass
+
+    recent_conversation = format_recent_context(
+        limit=MEMORY_TURNS,
+        session_id=None,
+    )
+
+    if recent_conversation:
+        memory_text += "\n\n" + recent_conversation
 
     instruction = AGENT_INSTRUCTION + memory_text
 
@@ -1181,11 +1269,12 @@ async def run():
 
     try:
         logger.info(
-            "🚀 WALL-E BOOT | Live=%s | Vision=%s (Ollama:%s) | UART=%s",
+            "🚀 WALL-E BOOT | Live=%s | Vision=%s (Ollama:%s) | UART=%s | Memory=SQLite(%d turns)",
             LIVE_MODEL,
             VISION_ENABLED,
             OLLAMA_VISION_MODEL or "NOT_SET",
             SERIAL_PORT_DISPLAY,
+            MEMORY_TURNS,
         )
 
         # Open UART once during startup so the first command is fast.
