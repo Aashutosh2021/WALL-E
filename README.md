@@ -1,26 +1,30 @@
 # 🤖 WALL-E — Autonomous AI Companion Robot
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-3B%2B%20(1GB)-C51A4A?style=for-the-badge&logo=Raspberry-Pi&logoColor=white)](https://www.raspberrypi.com/)
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-3B%2B%20%2F%204B-C51A4A?style=for-the-badge&logo=Raspberry-Pi&logoColor=white)](https://www.raspberrypi.com/)
 [![ESP32](https://img.shields.io/badge/ESP32-Master--Slave-E7352C?style=for-the-badge&logo=espressif&logoColor=white)](https://www.espressif.com/)
-[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-2.5%20Flash-4285F4?style=for-the-badge&logo=googlecloud&logoColor=white)](https://ai.google.dev/)
-[![LiveKit](https://img.shields.io/badge/LiveKit-Voice%20AI-000000?style=for-the-badge&logo=livekit&logoColor=white)](https://livekit.io/)
+[![Google Gemini](https://img.shields.io/badge/Google%20Gemini-Live%20Multimodal%20WebSocket-4285F4?style=for-the-badge&logo=googlecloud&logoColor=white)](https://ai.google.dev/)
+[![Ollama](https://img.shields.io/badge/Ollama-Cloud%20Vision-black?style=for-the-badge&logo=ollama&logoColor=white)](https://ollama.com/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
-**WALL-E** is an ultra-lightweight, zero-lag, RAM-optimized autonomous mini AI companion robot powered by **Raspberry Pi 3B+ (1GB RAM)** as the master brain and an **ESP32 Dev Module** as the motor and OLED expression driver.
+**WALL-E** is an ultra-low-latency, zero-lag, autonomous mini AI companion robot. It uses a **Raspberry Pi 3B+** as the primary master brain and an **ESP32 Dev Module** as the real-time motor controller and animated expression driver.
 
-Combining real-time multilingual voice AI (**Google Gemini 2.5 Flash**), instant camera vision, dynamic animated OLED eye expressions, and 2WD/4WD differential motor control over hardware UART serial communication.
+Driven by Google's **Gemini Multimodal Live API (`BidiGenerateContent`)** over raw WebSockets, WALL-E provides instant, human-like voice conversations (sub-100ms first-byte audio latency), real-time computer vision, animated web-based OLED eye expressions, differential motor movement, and autonomous agent tools.
 
 ---
 
 ## 🌟 Key Features
 
-- 🗣️ **Multilingual Voice AI**: Conversational natural voice interaction in Hindi, English, Hinglish, Marathi, Tamil, Telugu, and more using Google Gemini 2.5 Flash & LiveKit Agents.
-- 👁️ **Instant Camera Vision (`see_object`)**: Captures 640x480 video frames via CSI/USB camera for real-time scene and object analysis using Gemini Vision API.
-- 🤖 **Differential Motor Drive (`move_robot`)**: Real-time motor movement (`FORWARD`, `BACKWARD`, `LEFT`, `RIGHT`, `STOP`) driven by ESP32 + L293D Shield over 115200 Baud UART.
-- 📺 **Dynamic Animated OLED Eyes**: Expressive 0.96" SSD1306 OLED eyes synced to AI agent states (`EYES_LISTEN`, `EYES_THINKING`, `EYES_TALKING`, `EYES_NORMAL`).
-- ⚡ **Low RAM Footprint (< 170 MB)**: Headless, ultra-optimized Python runtime specifically built to run under 1GB RAM on Raspberry Pi 3B+ without freezing or lag.
-- 🌦️ **Smart Tools**: Real-time weather check via Open-Meteo API, DuckDuckGo/Wikipedia search, media playback, and time information.
+- ⚡ **Direct Gemini Multimodal Live API**: Full-duplex bidirectional streaming voice AI over WebSockets with native 16kHz PCM audio ingest and 24kHz speaker playback (`Puck` voice). Natural user barge-in/interruption supported out-of-the-box.
+- 👁️ **Persistent Warm Camera Vision (`see_object`)**: `picamera2` stream kept warm in memory with stale-frame purging. Vision requests execute via asynchronous REST API calls with real-time thumbnail preview streaming to the ESP32 Web UI.
+- 🤖 **4-Wheel Differential Drive (`move_robot`)**: 4-channel DC motor control via 74HC595 shift register and hardware PWM on L293D shield over 115200 Baud UART with automatic 3-second safety auto-stop.
+- 📺 **Interactive ESP32 Web Dashboard & OLED Visor**: ESP32 Soft-AP (`WALL-E_AP` @ `http://xxx.xxx.xxx.xxx`) hosting real-time animated CSS OLED visor eyes (`TALKING`, `LISTEN`, `THINK`, `HAPPY`, `ANGRY`, `SAD`, `NORMAL`), live camera thumbnails, and scrolling serial console logs.
+- 🌦️ **Autonomous Agent Tools**:
+  - `get_weather`: Auto-detects location from public IP, caches coordinates, and fetches Open-Meteo forecasts in < 80ms.
+  - `search_web`: Parallel DuckDuckGo and Wikipedia queries via `asyncio.gather`.
+  - `get_time_info`: Live date, time, and weekday info.
+  - `remember_fact`: Persistent JSON long-term memory (`memory.json`) auto-capped at 50 entries.
+- 🪶 **Ultra-Low Memory Footprint (< 80 MB)**: Headless, optimized Python runtime tailored to run smoothly on Raspberry Pi 3B+ (1GB RAM) without overheating or freezing.
 
 ---
 
@@ -34,16 +38,16 @@ graph TD
     A --> C["Buck Converter #2 (6.0V 2A)"]
     
     B --> D["Raspberry Pi 3B+ (Master Brain)"]
-    B --> E["ESP32 Dev Module (Slave Driver)"]
+    B --> E["ESP32 Dev Module (Slave Controller)"]
     C --> F["L293D Motor Shield"]
     
-    D -- "Hardware UART /dev/serial0 115200 Baud" --> E
-    D --> G["CSI / USB Camera"]
-    D --> H["USB Microphone & Speaker"]
+    D -- "USB / UART Serial (/dev/ttyUSB0 @ 115200 Baud)" --> E
+    D --> G["CSI Pi Camera (picamera2)"]
+    D --> H["USB Microphone & Speaker (PortAudio)"]
     
-    E --> I["0.96 SSD1306 OLED Eyes"]
-    F --> J["2x / 4x TT Gearbox Motors"]
-    E -- "Motor Shift Reg PWM" --> F
+    E --> I["Soft-AP Web UI (192.168.4.17)"]
+    F --> J["4x TT Gearbox Motors"]
+    E -- "74HC595 Shift Reg + PWM" --> F
 ```
 
 ---
@@ -55,30 +59,38 @@ sequenceDiagram
     autonumber
     actor User
     participant Pi as Raspberry Pi 3B+ (Master)
-    participant Gemini as Google Gemini 2.5 Flash
-    participant ESP32 as ESP32 (Slave Driver)
+    participant Gemini as Gemini Multimodal Live (WebSocket)
+    participant ESP32 as ESP32 (Slave Controller)
     
-    User->>Pi: Speaks into USB Microphone
-    Pi->>ESP32: Send UART "EYES_LISTEN\n"
-    ESP32-->>ESP32: OLED Eyes Wide Awake / Listening
+    User->>Pi: Speaks into USB Microphone (16kHz PCM Stream)
+    Pi->>Gemini: realtimeInput (mediaChunks audio/pcm)
+    Pi->>ESP32: Send UART "LISTEN\n"
+    ESP32-->>ESP32: Visor Eyes -> LISTEN (Glowing Cyan)
     
-    Pi->>Gemini: Transcribed Voice Prompt
-    Pi->>ESP32: Send UART "EYES_THINKING\n"
-    ESP32-->>ESP32: OLED Eyes Narrowed / Thinking Animation
+    Gemini-->>Pi: serverContent (modelTurn audio/pcm 24kHz)
+    Pi->>ESP32: Send UART "EYES_TALKING\n"
+    ESP32-->>ESP32: Visor Eyes -> TALKING (Pulsing Green)
+    Pi->>User: 24kHz Native Audio Output via Speaker
     
-    Gemini-->>Pi: Response Text & Tool Calls (e.g. move_robot, see_object)
-    
-    opt Tool Executed: move_robot("FORWARD")
+    opt Tool Call: move_robot("FORWARD")
+        Gemini-->>Pi: toolCall -> move_robot(direction="FORWARD")
         Pi->>ESP32: Send UART "FORWARD\n"
-        ESP32-->>ESP32: Motors rotate Forward (PWM 220)
+        ESP32-->>ESP32: 74HC595 Shift Out (0xD8) + PWM 200 (Auto-stops in 3s)
+        Pi->>Gemini: toolResponse ("WALL-E moving FORWARD.")
+    end
+
+    opt Tool Call: see_object("What do you see?")
+        Gemini-->>Pi: toolCall -> see_object(prompt="...")
+        Pi->>Pi: picamera2 grab fresh JPEG frame
+        Pi->>ESP32: Send UART "IMG:<base64_thumbnail>\n"
+        ESP32-->>ESP32: Web UI renders live camera snapshot
+        Pi->>Pi: Asynchronous REST Vision API Call
+        Pi->>Gemini: toolResponse (description text)
     end
     
-    Pi->>ESP32: Send UART "EYES_TALKING\n"
-    ESP32-->>ESP32: OLED Eyes Animate Blink / Speaking
-    Pi->>User: Audio Voice Output via Speaker
-    
-    Pi->>ESP32: Send UART "EYES_NORMAL\n"
-    ESP32-->>ESP32: OLED Eyes Default Idle Expression
+    Gemini-->>Pi: turnComplete: true
+    Pi->>ESP32: Send UART "EYES_NORMAL\n" & "IMG_CLEAR\n"
+    ESP32-->>ESP32: Visor Eyes -> IDLE & Clear Web Thumbnail
 ```
 
 ---
@@ -93,41 +105,42 @@ sequenceDiagram
 | **Buck #1 Output (Adjust to 5.0V)** | ESP32 Board | Pin `VIN / 5V` | 5.0V DC |
 | **Buck #2 Output (Adjust to 6.0V)** | L293D Motor Shield | `EXT_PWR (+M)` | 6.0V DC |
 
-### 2. Hardware UART Serial Link (Pi 3B+ to ESP32)
-> ⚠️ **Note:** Ground MUST be shared between Raspberry Pi, ESP32, and Buck converters. Cross-connect TX to RX.
-
-| Raspberry Pi 3B+ Pin | Pin Function | ESP32 Pin | ESP32 Pin Function |
-| :--- | :--- | :--- | :--- |
-| **Pin 8** | `GPIO 14 (TXD0)` | **GPIO 3** | `RX0` |
-| **Pin 10** | `GPIO 15 (RXD0)` | **GPIO 1** | `TX0` |
-| **Pin 6** | `GND` | **GND** | `GND` |
-
-### 3. OLED Display (0.96" SSD1306) to ESP32
-| OLED Pin | ESP32 Pin | Function |
+### 2. ESP32 to L293D Motor Shield (74HC595 Shift Register & PWM)
+| Signal Name | ESP32 GPIO | L293D Shield Function |
 | :--- | :--- | :--- |
-| **VCC** | **3.3V** or **5V** | Power |
-| **GND** | **GND** | Ground |
-| **SDA** | **GPIO 21** | I2C Data |
-| **SCL** | **GPIO 22** | I2C Clock |
+| **DIR_CLK** | `GPIO 16` | Shift Register Clock (Digital Pin 4) |
+| **DIR_EN** | `GPIO 17` | Shift Register Enable / Active LOW (Digital Pin 7) |
+| **DIR_SER** | `GPIO 5` | Shift Register Serial Data (Digital Pin 8) |
+| **DIR_LATCH** | `GPIO 18` | Shift Register Latch (Digital Pin 12) |
+| **PWM_M1** | `GPIO 19` | Motor 1 Speed PWM (D11) |
+| **PWM_M2** | `GPIO 23` | Motor 2 Speed PWM (D3) |
+| **PWM_M3** | `GPIO 25` | Motor 3 Speed PWM (D5) |
+| **PWM_M4** | `GPIO 26` | Motor 4 Speed PWM (D6) |
 
 ---
 
 ## 📡 Serial Communication Protocol (UART Specs)
 
 - **Baud Rate:** `115200 bps` | **Data Bits:** `8` | **Parity:** `None` | **Stop Bits:** `1`
+- **Port:** `/dev/ttyUSB0` (or configured via `.env` as `ESP32_PORT`)
 - **Delimiter:** Newline (`\n`)
 
-| Command String | Target Subsystem | Action Performed | ESP32 OLED Response |
+| Command String | Category | Action Performed | ESP32 Response |
 | :--- | :--- | :--- | :--- |
-| `FORWARD\n` | Motors | Both motors rotate Forward at PWM 220 | Eyes: Normal |
-| `BACKWARD\n` | Motors | Both motors rotate Backward at PWM 220 | Eyes: Normal |
-| `LEFT\n` | Motors | Left Reverse, Right Forward (Spin Left) | Eyes: Normal |
-| `RIGHT\n` | Motors | Left Forward, Right Reverse (Spin Right) | Eyes: Normal |
-| `STOP\n` | Motors | All motor channels disabled (0 PWM) | Eyes: Normal |
-| `EYES_LISTEN\n` | OLED Screen | None | Eyes: Wide Awake / Listening |
-| `EYES_THINKING\n`| OLED Screen | None | Eyes: Thinking animation |
-| `EYES_TALKING\n` | OLED Screen | None | Eyes: Animated Blink / Speaking |
-| `EYES_NORMAL\n`  | OLED Screen | None | Eyes: Default idle expression |
+| `FORWARD\n` | Motor | 4 Motors Forward (PWM 200, 3s auto-stop) | `ACK_FORWARD` |
+| `BACKWARD\n` | Motor | 4 Motors Backward (PWM 200, 3s auto-stop) | `ACK_BACKWARD` |
+| `LEFT\n` | Motor | Spin Left (PWM 200, 3s auto-stop) | `ACK_LEFT` |
+| `RIGHT\n` | Motor | Spin Right (PWM 200, 3s auto-stop) | `ACK_RIGHT` |
+| `STOP\n` | Motor | Stop all motors immediately (PWM 0) | `ACK_STOP` |
+| `EYES_TALKING\n` / `SPEAK\n` | Expression | Visor Eyes: Pulsing Green (Talking Animation) | `ACK_EYES_TALKING` |
+| `LISTEN\n` | Expression | Visor Eyes: Glowing Cyan (Listening) | `ACK_LISTEN` |
+| `EYES_THINKING\n` / `THINK\n` | Expression | Visor Eyes: Pulsing Yellow (Thinking) | `ACK_THINK` |
+| `HAPPY\n` | Expression | Visor Eyes: Curved Magenta Arcs | `ACK_HAPPY` |
+| `ANGRY\n` | Expression | Visor Eyes: Slanted Red Eyebrows | `ACK_ANGRY` |
+| `SAD\n` | Expression | Visor Eyes: Droopy Blue Eyes | `ACK_SAD` |
+| `EYES_NORMAL\n` / `IDLE\n` | Expression | Visor Eyes: Default Blue Visor | `ACK_IDLE` |
+| `IMG:<base64>\n` | Camera | Sets live JPEG thumbnail on ESP32 Web UI | None |
+| `IMG_CLEAR\n` | Camera | Clears JPEG thumbnail from ESP32 Web UI | `ACK_IMG_CLEAR` |
 
 ---
 
@@ -136,34 +149,35 @@ sequenceDiagram
 ```
 WALL-E/
 ├── WALL_E_Voice_Assistant/
-│   ├── main.py                   # Lightweight Headless Terminal Runner (Zero GUI Overhead)
-│   ├── WALL_E_Assistant.py       # Core LiveKit + Gemini 2.5 Flash Agent & Hardware Eye Sync
-│   ├── tools.py                  # RAM-optimized tools (move_robot, see_object, weather, search)
-│   ├── prompts.py                # System instructions & WALL-E robot identity specifications
-│   ├── .env                      # Environment configuration & API keys
-│   └── Tools/                    # Additional lightweight tool scripts
+│   ├── main.py                   # Interactive Terminal Launcher & Diagnostics
+│   ├── walle_direct_gemini.py    # Direct Gemini Multimodal Live WebSocket Client
+│   ├── tools.py                  # Agent tools (move_robot, see_object, weather, search, memory)
+│   ├── prompts.py                # System prompt, personality & identity rules
+│   ├── memory.json               # Persistent long-term memory storage
+│   └── .env                      # API keys & hardware configuration
 ├── WALL_E_ESP32/
-│   └── WALL_E_ESP32.ino          # ESP32 C++ Firmware (L293D Motor Drive + SSD1306 OLED Eyes)
+│   └── WALL_E_ESP32.ino          # ESP32 C++ Firmware (74HC595 L293D + Soft-AP Web Dashboard)
 ├── PRD.md                        # Product Requirement Document
 ├── TRD.md                        # Technical Requirement Document
 ├── Pinout & Wiring Matrix.md     # Full Hardware Schematic & Wiring Guide
-├── Serial Communication Protocol (UART Specs).md # Complete UART Command Protocol
-├── System Architecture & Flowcharts.md # High level architecture diagrams
-└── README.md                     # Main project documentation & guide
+├── Serial Communication Protocol (UART Specs).md # UART Protocol Specification
+├── System Architecture & Flowcharts.md # Architecture & sequence flowcharts
+└── README.md                     # Main project guide
 ```
 
 ---
 
 ## 🚀 Quick Start Guide
 
-### 1. Prerequisites (Raspberry Pi 3B+)
-Ensure Raspberry Pi OS (Bookworm 64-bit Lite) is installed. Enable Hardware UART serial in Raspberry Pi Configuration:
+### 1. Prerequisites (Raspberry Pi OS 64-bit Lite)
+Enable camera and serial hardware support:
 ```bash
 sudo raspi-config
-# Interface Options -> Serial Port -> Enable Hardware Serial (/dev/serial0), Disable Serial Console
+# Interface Options -> Camera -> Enable
+# Interface Options -> Serial Port -> Enable Hardware Serial (/dev/ttyUSB0 or /dev/serial0)
 ```
 
-### 2. Clone & Environment Setup
+### 2. Installation & Setup
 ```bash
 cd ~
 git clone https://github.com/Aashutosh2021/WALL-E.git
@@ -173,50 +187,43 @@ cd WALL-E/WALL_E_Voice_Assistant
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install lightweight dependencies
-pip install livekit-agents livekit-plugins-google livekit-plugins-noise-cancellation python-dotenv opencv-python aiohttp pyserial
+# Install dependencies
+pip install websockets sounddevice numpy opencv-python aiohttp pyserial python-dotenv orjson picamera2
 ```
 
 ### 3. Configure Environment (`.env`)
 Create or edit `.env` inside `WALL_E_Voice_Assistant/`:
 ```env
-LIVEKIT_URL=wss://xxxxx-xxxxxxx.livekit.cloud
-LIVEKIT_API_KEY=YOUR_LIVEKIT_KEY
-LIVEKIT_API_SECRET=YOUR_LIVEKIT_SECRET
-
-GOOGLE_API_KEY=YOUR_GOOGLE_API_KEY
-ROBOT_NAME='WALL-E'
-USER_NAME='Aashutosh'
-WALLE_VARIANT='ultra'
-LAN=Hindi
-LOG_LEVEL=INFO
-SERIAL_PORT='/dev/serial0'
+GOOGLE_API_KEY="AIzaSy..."
+ROBOT_NAME="WALL-E"
+USER_NAME="Aashutosh"
+LAN="Hindi"
+ESP32_PORT="/dev/ttyUSB0"
 BAUD_RATE=115200
+
+# Optional: Ollama Cloud Vision
+OLLAMA_CLOUD_URL="https://ollama.com"
+OLLAMA_API_KEY=""
+OLLAMA_VISION_MODEL="gemma4:31b"
 ```
 
 ### 4. Flash ESP32 Firmware
-Open `WALL_E_ESP32/WALL_E_ESP32.ino` in Arduino IDE, select **ESP32 Dev Module**, install `Adafruit_SSD1306` and `Adafruit_GFX` libraries, and upload to the ESP32 board.
+Open `WALL_E_ESP32/WALL_E_ESP32.ino` in Arduino IDE, select **ESP32 Dev Module**, and upload.
 
 ### 5. Launch WALL-E Robot
-
-#### Option A: Direct Gemini Live WebSocket (Ultra-low ~300ms Latency, 30MB RAM)
 ```bash
 cd ~/WALL-E/WALL_E_Voice_Assistant
 source .venv/bin/activate
-python main.py
+python3 main.py
 ```
+Select **Option 1** (`⚡ Run WALL-E (Ultra-Low Latency Mode)`).
 
-#### Option B: LiveKit Cloud Room Worker
-```bash
-cd ~/WALL-E/WALL_E_Voice_Assistant
-source .venv/bin/activate
-python main.py dev
-```
+To view the live web visor and logs, connect your phone or laptop to Wi-Fi SSID `WALL-E_AP` (Password: `password123`) and open `http://192.168.4.17` in your browser.
 
 ---
 
 ## 👤 Author & Credits
 
 - **Creator & Lead Developer:** [Aashutosh Kumar](https://github.com/Aashutosh2021)
-- **Built For:** Desktop AI Robotics & Low-Power Embedded Systems
+- **Built For:** Real-Time Multimodal Robotics & Embedded AI
 - **License:** MIT License
