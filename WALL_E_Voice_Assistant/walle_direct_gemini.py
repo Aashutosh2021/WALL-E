@@ -105,10 +105,26 @@ _current_eye = None
 # Current turn transcripts. Gemini may send transcription in multiple chunks.
 _user_transcript_parts = []
 _ai_transcript_parts = []
+_image_analysis_active = False
+_image_analysis_completed = False
+_turn_started_at = None
+_first_ai_text_at = None
+_ai_audio_started_at = None
 
 
 def _stamp():
     return time.strftime("%H:%M:%S.") + f"{int((time.time() % 1) * 1000):03d}"
+
+
+def _latency_ms(start, end=None):
+    if start is None:
+        return None
+    return ((end if end is not None else time.monotonic()) - start) * 1000
+
+
+def _log_latency(label, ms):
+    if ms is not None:
+        logger.info("⚡ LATENCY | %s | %.0f ms (%.2f s)", label, ms, ms / 1000.0)
 
 
 def log_user(text):
@@ -546,6 +562,8 @@ async def _vision_request(jpeg, prompt):
         out,
     )
 
+    global _image_analysis_completed
+    _image_analysis_completed = True
     return out
 
 
@@ -636,8 +654,13 @@ async def handle_other_tool(call):
     log_tool(name, args)
 
     if name == "see_object":
-        loop = asyncio.get_running_loop()
+        global _image_analysis_active
 
+        _image_analysis_active = True
+        loop = asyncio.get_running_loop()
+        vision_tool_started = time.monotonic()
+
+        logger.info("📷 SEE_OBJECT | image analysis started | args=%s", args)
         logger.info("📷 SEE_OBJECT | capturing fresh frame...")
         jpeg = await loop.run_in_executor(
             None,
@@ -666,6 +689,11 @@ async def handle_other_tool(call):
             jpeg,
             args.get("prompt", "Describe what you see."),
             os.getenv("GOOGLE_API_KEY", ""),
+        )
+
+        _log_latency(
+            "see_object tool total",
+            _latency_ms(vision_tool_started),
         )
 
         logger.info(
@@ -714,6 +742,8 @@ async def handle_other_tool(call):
 
 async def receive_loop(ws, speaker_info):
     global is_ai_speaking
+    global _turn_started_at, _first_ai_text_at, _ai_audio_started_at
+    global _image_analysis_active, _image_analysis_completed
 
     speaker, rate = speaker_info
     loop = asyncio.get_running_loop()
@@ -740,6 +770,16 @@ async def receive_loop(ws, speaker_info):
             if inp:
                 text = inp.get("text", "")
                 if text:
+                    now = time.monotonic()
+
+                    if not _user_transcript_parts:
+                        _turn_started_at = now
+                        _first_ai_text_at = None
+                        _ai_audio_started_at = None
+                        _image_analysis_active = False
+                        _image_analysis_completed = False
+                        logger.info("🎤 USER TURN START [%s]", _stamp())
+
                     _user_transcript_parts.append(text)
                     logger.info(
                         "👤 USER TRANSCRIPT [%s] | %s",
@@ -752,13 +792,35 @@ async def receive_loop(ws, speaker_info):
             # ---------------------------------------------------------------
             out = sc.get("outputTranscription")
             if out:
+
                 text = out.get("text", "")
+
                 if text:
+
+                    now = time.monotonic()
+
+                    if _first_ai_text_at is None:
+
+                        _first_ai_text_at = now
+
+                        _log_latency(
+
+                            "user first transcript → AI first transcript",
+
+                            _latency_ms(_turn_started_at, now),
+
+                        )
+
                     _ai_transcript_parts.append(text)
+
                     logger.info(
+
                         "🤖 AI TRANSCRIPT [%s] | %s",
+
                         _stamp(),
+
                         text,
+
                     )
 
             if sc.get("interrupted"):
@@ -774,9 +836,14 @@ async def receive_loop(ws, speaker_info):
 
                     if x and x.get("data"):
                         if not is_ai_speaking:
+                            _ai_audio_started_at = time.monotonic()
                             logger.info(
                                 "🔊 AI AUDIO START [%s]",
                                 _stamp(),
+                            )
+                            _log_latency(
+                                "user first transcript → AI audio start",
+                                _latency_ms(_turn_started_at, _ai_audio_started_at),
                             )
 
                         is_ai_speaking = True
@@ -818,12 +885,32 @@ async def receive_loop(ws, speaker_info):
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
 
-                if ESP_IMAGE:
-                    await loop.run_in_executor(
+                # Clear the ESP32 image ONLY after a successful image-analysis turn.
+                if _image_analysis_active and _image_analysis_completed:
+                    logger.info("🧹 IMAGE ANALYSIS COMPLETE | sending IMG_CLEAR")
+                    clear_ok = await loop.run_in_executor(
                         None,
                         send_uart_command,
                         "IMG_CLEAR",
                     )
+                    logger.info("🧹 IMG_CLEAR RESULT | sent=%s", clear_ok)
+                elif _image_analysis_active:
+                    logger.warning(
+                        "⚠️ IMAGE TURN ENDED WITHOUT SUCCESSFUL ANALYSIS | "
+                        "IMG_CLEAR NOT SENT"
+                    )
+
+                if _turn_started_at is not None:
+                    _log_latency(
+                        "user first transcript → turn complete",
+                        _latency_ms(_turn_started_at),
+                    )
+
+                _image_analysis_active = False
+                _image_analysis_completed = False
+                _turn_started_at = None
+                _first_ai_text_at = None
+                _ai_audio_started_at = None
 
         # ---------------------------------------------------------------
         # TOOL CALLS
