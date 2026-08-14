@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from prompts import AGENT_INSTRUCTION
-from walle_tools_fast import send_uart_command, TOOL_MAP, close_uart
+from tools import send_uart_command, TOOL_MAP, close_uart
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("WALLE")
