@@ -291,72 +291,42 @@ async def _get_vision_session() -> aiohttp.ClientSession:
     return _vision_http_session
 
 async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Analyze image with ultra-fast latency.
-    Prefers Ollama Cloud if configured; automatically falls back to Gemini 3.6 Flash.
+    """Analyze image via Ollama Cloud / REST API.
+
+    Returns a text description that gets put into the toolResponse.
+    Uses Ollama's /api/generate endpoint format.
     """
-    ollama_url = os.getenv("OLLAMA_CLOUD_URL", "").rstrip("/")
+    url = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/") + "/api/generate"
     ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
-    ollama_model = os.getenv("OLLAMA_VISION_MODEL", "").strip()
+    model = os.getenv("OLLAMA_VISION_MODEL", "") # Or your specific gemma model name
 
     base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-    session = await _get_vision_session()
+    payload = {
+        "model": model,
+        "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
+        "images": [base64_img],
+        "stream": False
+    }
 
-    # Strategy 1: Ollama Cloud (if URL and model configured)
-    if ollama_url and ollama_model:
-        endpoint = f"{ollama_url}/api/generate"
-        payload = {
-            "model": ollama_model,
-            "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
-            "images": [base64_img],
-            "stream": False
-        }
-        headers = {"Content-Type": "application/json"}
-        if ollama_api_key:
-            headers["Authorization"] = f"Bearer {ollama_api_key}"
+    headers = {"Content-Type": "application/json"}
+    if ollama_api_key:
+        headers["Authorization"] = f"Bearer {ollama_api_key}"
 
-        try:
-            t0 = _time.monotonic()
-            async with session.post(endpoint, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    desc = data.get("response", "").strip()
-                    if desc:
-                        logger.info(f"👁️ Ollama vision completed in {(_time.monotonic()-t0)*1000:.0f}ms ({ollama_model})")
-                        return desc
-                else:
-                    err = await resp.text()
-                    logger.warning(f"Ollama Vision error {resp.status}: {err[:150]}, falling back to Gemini Flash")
-        except Exception as e:
-            logger.warning(f"Ollama Vision failed ({e}), falling back to Gemini Flash")
-
-    # Strategy 2: Google Gemini Flash REST API (lightning fast ~300ms)
-    google_key = api_key or os.getenv("GOOGLE_API_KEY", "").strip()
-    if google_key:
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={google_key}"
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inlineData": {"mimeType": "image/jpeg", "data": base64_img}},
-                    {"text": f"Briefly describe what you see in this image in 1-3 short sentences. Focus on: {prompt}"}
-                ]
-            }],
-            "generationConfig": {"maxOutputTokens": 150}
-        }
-        try:
-            t0 = _time.monotonic()
-            async with session.post(gemini_url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    desc = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    logger.info(f"👁️ Gemini Flash vision completed in {(_time.monotonic()-t0)*1000:.0f}ms")
-                    return desc
-                else:
-                    err = await resp.text()
-                    logger.warning(f"Gemini Flash Vision error {resp.status}: {err[:150]}")
-        except Exception as e:
-            logger.warning(f"Gemini Flash Vision failed: {e}")
-
-    return "I captured a photo, but could not analyze it right now."
+    try:
+        session = await _get_vision_session()
+        t0 = _time.monotonic()
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                logger.info(f"👁️ Ollama vision call took {(_time.monotonic()-t0)*1000:.0f}ms (model={model})")
+                return data.get("response", "I looked, but couldn't recognize anything.")
+            else:
+                err = await resp.text()
+                logger.warning(f"Ollama Vision API error {resp.status}: {err[:200]}")
+                return "Could not analyze the image right now."
+    except Exception as e:
+        logger.warning(f"Ollama Vision API call failed: {e}")
+        return "Image analysis failed due to a network error."
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
     """Receives Gemini Live WebSocket messages (Audio, Camera requests & Tool Calls)."""
