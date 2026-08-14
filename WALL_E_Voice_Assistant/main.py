@@ -1,8 +1,11 @@
 """WALL-E launcher."""
 import asyncio
 from dotenv import load_dotenv
+
 load_dotenv(override=True)
+
 from walle_direct_gemini import run
+
 
 if __name__ == "__main__":
     try:
