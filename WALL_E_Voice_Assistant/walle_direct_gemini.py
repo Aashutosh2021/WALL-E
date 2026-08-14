@@ -78,11 +78,14 @@ ESP_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {
     "1", "true", "yes", "on"
 }
 
-# Gemini 2.0 Flash was shut down. Keep this overrideable from .env.
-VISION_MODEL = os.getenv(
-    "GEMINI_VISION_MODEL",
-    "gemini-3.5-flash",
-)
+# Ollama vision configuration.
+# The Live voice/tool model remains Gemini; only image analysis uses Ollama.
+OLLAMA_CLOUD_URL = os.getenv(
+    "OLLAMA_CLOUD_URL",
+    "https://ollama.com",
+).rstrip("/")
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "").strip()
 
 LIVE_MODEL = os.getenv(
     "GEMINI_LIVE_MODEL",
@@ -431,7 +434,7 @@ async def mic_loop(ws, mic):
 
 
 # ---------------------------------------------------------------------------
-# Gemini vision
+# Ollama vision
 # ---------------------------------------------------------------------------
 
 vision_session = None
@@ -441,8 +444,8 @@ async def get_vision_session():
     global vision_session
 
     if vision_session is None or vision_session.closed:
-        # Force IPv4 because Raspberry Pi/network environments can have
-        # broken/slow IPv6 routes while the Live WebSocket still works.
+        # Reuse the HTTP connection so every see_object call does not pay
+        # a fresh TLS/connect handshake.
         connector = aiohttp.TCPConnector(
             family=socket.AF_INET,
             limit=2,
@@ -452,164 +455,124 @@ async def get_vision_session():
         vision_session = aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(
-                total=25,
+                total=20,
                 connect=5,
                 sock_connect=5,
-                sock_read=20,
+                sock_read=15,
             ),
         )
 
     return vision_session
 
 
-async def _vision_request(jpeg, prompt, key, model):
-    """One Gemini REST vision request with detailed diagnostics."""
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent"
-    )
+async def _vision_request(jpeg, prompt):
+    """Analyze one fresh camera JPEG through Ollama /api/generate."""
+    if not OLLAMA_VISION_MODEL:
+        return "OLLAMA_VISION_MODEL is missing."
+
+    url = OLLAMA_CLOUD_URL + "/api/generate"
 
     payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": (
-                            "Describe what you see in 1-2 concise sentences. "
-                            "Focus on: "
-                            + (
-                                prompt
-                                or "everything important in the scene."
-                            )
-                        )
-                    },
-                    {
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": base64.b64encode(jpeg).decode(),
-                        }
-                    },
-                ]
-            }
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": (
+            "Describe what you see in 1-2 concise sentences. "
+            "Focus on: "
+            + (prompt or "everything important in the scene.")
+        ),
+        "images": [
+            base64.b64encode(jpeg).decode("utf-8")
         ],
-        "generationConfig": {
-            "maxOutputTokens": 100,
-            "temperature": 0.2,
-        },
+        "stream": False,
     }
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
     s = await get_vision_session()
     t0 = time.monotonic()
 
     logger.info(
-        "🌐 VISION START | model=%s | image=%d bytes",
-        model,
+        "🌐 OLLAMA VISION START | model=%s | image=%d bytes",
+        OLLAMA_VISION_MODEL,
         len(jpeg),
     )
 
     async with s.post(
         url,
-        params={"key": key},
         json=payload,
+        headers=headers,
     ) as r:
-
         text = await r.text()
         elapsed = (time.monotonic() - t0) * 1000
 
         logger.info(
-            "🌐 VISION HTTP | status=%s | %.0f ms",
+            "🌐 OLLAMA VISION HTTP | status=%s | %.0f ms",
             r.status,
             elapsed,
         )
 
         if r.status != 200:
             logger.error(
-                "❌ VISION HTTP ERROR | %s | %s",
+                "❌ OLLAMA VISION HTTP ERROR | %s | %s",
                 r.status,
                 text[:1000],
             )
             return (
-                f"Gemini vision error {r.status}: "
+                f"Ollama vision error {r.status}: "
                 f"{text[:300]}"
             )
 
     try:
         d = json.loads(text)
     except Exception:
-        logger.error("❌ VISION INVALID JSON | %s", text[:500])
-        return "Gemini returned an invalid vision response."
+        logger.error("❌ OLLAMA VISION INVALID JSON | %s", text[:500])
+        return "Ollama returned an invalid vision response."
 
-    candidates = d.get("candidates") or []
-
-    if not candidates:
-        logger.error(
-            "❌ VISION EMPTY RESPONSE | %s",
-            json.dumps(d)[:1000],
-        )
-        return "Gemini returned no image analysis."
-
-    parts = (
-        candidates[0]
-        .get("content", {})
-        .get("parts", [])
-    )
-
-    out = " ".join(
-        p.get("text", "")
-        for p in parts
-        if p.get("text")
-    ).strip()
+    out = (d.get("response") or "").strip()
 
     if not out:
-        return "I could not recognize anything clearly."
+        logger.error(
+            "❌ OLLAMA VISION EMPTY RESPONSE | %s",
+            json.dumps(d)[:1000],
+        )
+        return "Ollama returned no image analysis."
 
     logger.info(
-        "🌐 VISION RESULT | %s",
+        "🌐 OLLAMA VISION RESULT | %s",
         out,
     )
 
     return out
 
 
-async def analyze_image(jpeg, prompt, key):
+async def analyze_image(jpeg, prompt, key=None):
     if not VISION_ENABLED:
         logger.warning("⚠️ Vision disabled by ENABLE_VISION")
         return "Vision is disabled."
 
-    if not key:
-        return "GOOGLE_API_KEY is missing."
-
     if not jpeg:
         return "No image captured."
 
-    model = os.getenv(
-        "GEMINI_VISION_MODEL",
-        VISION_MODEL,
-    ).strip()
+    if not OLLAMA_VISION_MODEL:
+        logger.error("❌ OLLAMA_VISION_MODEL is missing in .env")
+        return "OLLAMA_VISION_MODEL is missing."
 
-    # Retry only network/timeout failures once.
-    # HTTP 4xx/5xx responses are returned immediately because retrying
-    # an invalid model/API key does not help.
     for attempt in (1, 2):
         try:
-            result = await _vision_request(
+            return await _vision_request(
                 jpeg,
                 prompt,
-                key,
-                model,
             )
-
-            # Do not retry explicit API responses.
-            if result.startswith("Gemini vision error "):
-                return result
-
-            return result
 
         except asyncio.TimeoutError:
             logger.warning(
-                "⏱️ VISION TIMEOUT | attempt=%d/2 | model=%s",
+                "⏱️ OLLAMA VISION TIMEOUT | attempt=%d/2 | model=%s",
                 attempt,
-                model,
+                OLLAMA_VISION_MODEL,
             )
 
             if attempt == 2:
@@ -622,7 +585,7 @@ async def analyze_image(jpeg, prompt, key):
 
         except aiohttp.ClientError as e:
             logger.warning(
-                "🌐 VISION NETWORK ERROR | attempt=%d/2 | %s",
+                "🌐 OLLAMA VISION NETWORK ERROR | attempt=%d/2 | %s",
                 attempt,
                 e,
             )
@@ -630,14 +593,14 @@ async def analyze_image(jpeg, prompt, key):
             if attempt == 2:
                 return (
                     "Image analysis failed because the "
-                    "vision network request failed."
+                    "Ollama vision network request failed."
                 )
 
             await asyncio.sleep(0.15)
 
         except Exception as e:
             logger.exception(
-                "❌ VISION UNEXPECTED ERROR | %s",
+                "❌ OLLAMA VISION UNEXPECTED ERROR | %s",
                 e,
             )
             return f"Image analysis failed: {e}"
@@ -1131,10 +1094,10 @@ async def run():
 
     try:
         logger.info(
-            "🚀 WALL-E BOOT | Live=%s | Vision=%s (%s) | UART=%s",
+            "🚀 WALL-E BOOT | Live=%s | Vision=%s (Ollama:%s) | UART=%s",
             LIVE_MODEL,
             VISION_ENABLED,
-            VISION_MODEL,
+            OLLAMA_VISION_MODEL or "NOT_SET",
             SERIAL_PORT_DISPLAY,
         )
 
