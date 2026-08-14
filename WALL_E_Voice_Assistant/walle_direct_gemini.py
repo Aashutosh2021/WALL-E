@@ -1,646 +1,299 @@
+"""WALL-E fast Gemini Live client.
+- Gemini Live handles realtime voice/tool calling.
+- Gemini 3.5 Flash handles one-shot camera analysis over REST.
+- ESP32 is controlled over persistent USB serial (/dev/ttyUSB0 by default).
+- Camera stays warm with picamera2 when available.
 """
-WALL-E AI Companion Robot - Direct Gemini Multimodal Live Client
-Ultra-Low Latency Raw WebSocket to Google Gemini (BidiGenerateContent)
-"""
-
-import os
-import sys
-import asyncio
+import os, sys, asyncio, logging, json, base64, subprocess, shutil, time
 import inspect
-import logging
-import json
-import base64
-import subprocess
-import shutil
 import numpy as np
 import sounddevice as sd
 import websockets
 import aiohttp
-import time as _time
-from datetime import datetime
 
-# Fast JSON for the hot WebSocket path (falls back to stdlib json if orjson missing)
 try:
     import orjson
-    def _dumps(obj) -> str:
-        return orjson.dumps(obj).decode()
-    _loads = orjson.loads
+    dumps = lambda x: orjson.dumps(x).decode()
+    loads = orjson.loads
 except ImportError:
-    def _dumps(obj) -> str:
-        return json.dumps(obj)
-    _loads = json.loads
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8')
+    dumps = json.dumps
+    loads = json.loads
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
 from prompts import AGENT_INSTRUCTION
-from tools import send_uart_command, TOOL_MAP
+from walle_tools_fast import send_uart_command, TOOL_MAP, close_uart
 
-# Flag to control mic feedback while AI is speaking
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger("WALLE")
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+MIC_CHUNK = int(os.getenv("MIC_CHUNK", "512"))
+VISION_ENABLED = os.getenv("ENABLE_VISION", "1").lower() in {"1","true","yes","on"}
+ESP_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {"1","true","yes","on"}
+VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash")
+LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "models/gemini-2.5-flash-native-audio-preview-12-2025")
+
 is_ai_speaking = False
+_last_audio = 0.0
+_turn_started = False
+_current_eye = None
 
-# Latency tracking
-_last_user_audio_ts = 0.0   # timestamp of last mic chunk sent
-_first_ai_audio_ts = 0.0    # timestamp of first AI audio byte received in current turn
-_ai_turn_started = False     # whether we've logged the first-byte latency for this turn
-
-# ---------------------------------------------------------------------------
-# Multi-Strategy Camera — picamera2 (persistent, warm) → rpicam-still →
-# libcamera-still → OpenCV (USB/Windows)
-# ---------------------------------------------------------------------------
+# ---------------- Camera ----------------
 try:
     from picamera2 import Picamera2
-    _HAS_PICAM2 = True
+    HAS_PICAM2 = True
 except ImportError:
     Picamera2 = None
-    _HAS_PICAM2 = False
+    HAS_PICAM2 = False
 
-_HAS_RPICAM = shutil.which("rpicam-still") is not None
-_HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
+HAS_RPICAM = shutil.which("rpicam-still") is not None
+HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
 
-class _CameraManager:
-    """Captures frames. Prefers a persistent picamera2 sensor (opened once, kept
-    warm) — avoids the ~500ms-1s cold-start of spawning rpicam-still per call.
-    Falls back to rpicam-still / libcamera-still subprocess, then OpenCV."""
+class Camera:
     def __init__(self):
-        self._cv_cap = None
-        self._picam2 = None
-
-        if _HAS_PICAM2:
+        self.picam = None
+        self.cap = None
+        if HAS_PICAM2:
             try:
-                self._picam2 = Picamera2()
-                config = self._picam2.create_still_configuration(
-                    main={"size": (320, 240), "format": "RGB888"}  # RGB888 = [B,G,R] per-pixel — already OpenCV-ready, no cvtColor needed
-                )
-                self._picam2.configure(config)
-                self._picam2.start()
-                logger.info("📷 Camera backend: picamera2 (persistent, sensor kept warm)")
+                self.picam = Picamera2()
+                cfg = self.picam.create_still_configuration(main={"size":(320,240),"format":"RGB888"})
+                self.picam.configure(cfg)
+                self.picam.start()
+                time.sleep(0.15)
+                logger.info("Camera: persistent picamera2 320x240")
             except Exception as e:
-                logger.error(f"picamera2 init failed, falling back to subprocess camera: {e}")
-                self._picam2 = None
+                logger.warning("picamera2 unavailable: %s", e)
+                self.picam = None
+        if self.picam is None:
+            logger.info("Camera fallback: %s", "rpicam-still" if HAS_RPICAM else "libcamera-still" if HAS_LIBCAMERA else "OpenCV")
 
-        if self._picam2 is None:
-            if _HAS_RPICAM:
-                logger.info("📷 Camera backend: rpicam-still (Pi CSI, cold-start per call)")
-            elif _HAS_LIBCAMERA:
-                logger.info("📷 Camera backend: libcamera-still (Pi CSI legacy, cold-start per call)")
-            else:
-                logger.info("📷 Camera backend: OpenCV (USB/Windows)")
-
-    def grab_jpeg(self) -> bytes | None:
-        """Grab a single JPEG frame using the best available method."""
-        # Strategy 0: picamera2 — persistent, warm sensor (fastest, no process spawn)
-        if self._picam2 is not None:
-            return self._grab_picam2()
-        # Strategy 1: rpicam-still (modern Raspberry Pi OS 64-bit)
-        if _HAS_RPICAM:
-            return self._grab_rpicam()
-        # Strategy 2: libcamera-still (older Pi OS)
-        if _HAS_LIBCAMERA:
-            return self._grab_libcamera()
-        # Strategy 3: OpenCV (USB cameras, Windows)
-        return self._grab_opencv()
-
-    def _grab_picam2(self) -> bytes | None:
+    def grab(self):
         try:
             import cv2
-            # Flush stale buffered frames — capture_array can return old data
-            # from the internal ring buffer. Drop 2 frames to guarantee freshness.
-            for _ in range(2):
-                self._picam2.capture_array("main")
-            frame = self._picam2.capture_array("main")
-            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-            if not ok:
-                return None
-            jpeg_bytes = buf.tobytes()
-            logger.info(f"📸 picamera2 captured {len(jpeg_bytes)}B (fresh frame, 2 stale dropped)")
-            return jpeg_bytes
-        except Exception as e:
-            logger.error(f"picamera2 capture error: {e}")
-            return None
-
-    def _grab_rpicam(self) -> bytes | None:
-        try:
-            result = subprocess.run(
-                ["rpicam-still", "--output", "-", "--width", "320", "--height", "240",
-                 "--quality", "50", "--nopreview", "--immediate", "1",
-                 "--encoding", "jpg", "--timeout", "1"],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0 and len(result.stdout) > 100:
-                logger.info(f"📸 rpicam-still captured {len(result.stdout)}B")
-                return result.stdout
-            logger.warning(f"rpicam-still failed: rc={result.returncode} stderr={result.stderr[:200]}")
-            return None
-        except Exception as e:
-            logger.error(f"rpicam-still error: {e}")
-            return None
-
-    def _grab_libcamera(self) -> bytes | None:
-        try:
-            result = subprocess.run(
-                ["libcamera-still", "--output", "-", "--width", "320", "--height", "240",
-                 "--quality", "50", "--nopreview", "--immediate",
-                 "--encoding", "jpg", "--timeout", "1"],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0 and len(result.stdout) > 100:
-                logger.info(f"📸 libcamera-still captured {len(result.stdout)}B")
-                return result.stdout
-            return None
-        except Exception as e:
-            logger.error(f"libcamera-still error: {e}")
-            return None
-
-    def _grab_opencv(self) -> bytes | None:
-        try:
-            import cv2
-            if self._cv_cap is None or not self._cv_cap.isOpened():
-                self._cv_cap = cv2.VideoCapture(0)
-                if not self._cv_cap.isOpened():
-                    self._cv_cap = None
-                    return None
-                self._cv_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-                self._cv_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-                self._cv_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            self._cv_cap.grab()  # flush stale frame 1
-            self._cv_cap.grab()  # flush stale frame 2
-            self._cv_cap.grab()  # flush stale frame 3
-            ret, frame = self._cv_cap.read()
-            if not ret or frame is None:
-                return None
-            ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+            if self.picam is not None:
+                # Drop buffered frames so "look" uses the latest scene.
+                self.picam.capture_array("main")
+                self.picam.capture_array("main")
+                frame = self.picam.capture_array("main")
+                ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                return buf.tobytes() if ok else None
+            if HAS_RPICAM:
+                r = subprocess.run(["rpicam-still","--output","-","--width","320","--height","240","--quality","50","--nopreview","--immediate","1","--encoding","jpg","--timeout","1"], capture_output=True, timeout=4)
+                return r.stdout if r.returncode == 0 and len(r.stdout) > 100 else None
+            if HAS_LIBCAMERA:
+                r = subprocess.run(["libcamera-still","--output","-","--width","320","--height","240","--quality","50","--nopreview","--immediate","--encoding","jpg","--timeout","1"], capture_output=True, timeout=4)
+                return r.stdout if r.returncode == 0 and len(r.stdout) > 100 else None
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(0)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            self.cap.grab(); self.cap.grab()
+            ok, frame = self.cap.read()
+            if not ok: return None
+            ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY),50])
             return buf.tobytes() if ok else None
         except Exception as e:
-            logger.error(f"OpenCV grab error: {e}")
-            try: self._cv_cap.release()
-            except: pass
-            self._cv_cap = None
+            logger.warning("Camera capture failed: %s", e)
             return None
 
     def close(self):
-        if self._picam2 is not None:
-            try: self._picam2.stop()
-            except: pass
-            try: self._picam2.close()
-            except: pass
-            self._picam2 = None
-        if self._cv_cap is not None:
-            try: self._cv_cap.release()
-            except: pass
-            self._cv_cap = None
+        if self.picam:
+            try: self.picam.stop(); self.picam.close()
+            except Exception: pass
+        if self.cap:
+            try: self.cap.release()
+            except Exception: pass
 
-_camera = _CameraManager()
-# ---------------------------------------------------------------------------
-# State tracking for eye animation
-# ---------------------------------------------------------------------------
+camera = Camera()
 
-# State track karne ke liye global variable
-_current_eye_state = None
+# ---------------- Eyes ----------------
+def eye(state):
+    global _current_eye
+    valid = {"BOOT","IDLE","LISTEN","SPEAK","EYES_TALKING","EYES_NORMAL","THINK","STOP","HAPPY","SAD","ANGRY"}
+    if state not in valid or state == _current_eye: return
+    _current_eye = state
+    try:
+        asyncio.get_running_loop().run_in_executor(None, send_uart_command, state)
+    except RuntimeError:
+        send_uart_command(state)
 
-def set_eye_state(state: str):
-    """Sends eye animation command over USB only if state actually changes."""
-    global _current_eye_state
-    
-    valid_states = ["BOOT", "IDLE", "LISTEN", "SPEAK", "EYES_TALKING", "EYES_NORMAL", "THINK", "STOP", "HAPPY", "SAD", "ANGRY"]
-    if state not in valid_states:
-        return
-        
-    # Ignore duplicate commands (Pehle se EYES_TALKING hai toh wapas mat bhejo)
-    if state == _current_eye_state:
-        return
-        
-    _current_eye_state = state
-    logger.info(f"👁️ Eye state changed to: {state}")
-    
-    # Run serial write in a background thread so audio playback never stutters
-    asyncio.get_event_loop().run_in_executor(None, send_uart_command, state)
-
-# ---------------------------------------------------------------------------
-# OPTIMIZED Audio Helpers — zero-copy where possible
-# ---------------------------------------------------------------------------
-def _resample_24k_to_48k(raw_pcm_bytes: bytes) -> bytes:
-    """Ultra-fast 2x upsample via np.repeat (zero interpolation overhead)."""
-    pcm = np.frombuffer(raw_pcm_bytes, dtype=np.int16)
-    if len(pcm) == 0:
-        return b""
-    return np.repeat(pcm, 2).tobytes()
-
-def _open_speaker_stream():
-    """Open speaker at model-native 24kHz first (zero resample). Fallback 48k (cheap 2x resample).
-    44100 dropped on purpose — old code never resampled for it, causing pitched/fast audio."""
-    for rate in [24000, 48000]:
+# ---------------- Audio ----------------
+def open_speaker():
+    for rate in (24000, 48000):
         try:
-            stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype='int16')
-            stream.start()
-            logger.info(f"🔊 Speaker opened at {rate}Hz.")
-            return stream, rate
-        except Exception:
-            continue
-    logger.warning("❌ Could not open any speaker output stream.")
-    return None, 48000
+            s = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16")
+            s.start(); return s, rate
+        except Exception: pass
+    return None, 24000
 
-# ---------------------------------------------------------------------------
-# WebSocket Audio Input & Output Loops
-# ---------------------------------------------------------------------------
-MIC_CHUNK = 1024  # 64ms at 16kHz — half the old 128ms for faster voice detection
+def resample24to48(b):
+    return np.repeat(np.frombuffer(b, dtype=np.int16), 2).tobytes()
 
-async def send_audio_loop(ws, mic_stream):
-    """Streams recorded microphone PCM audio chunks over WebSocket."""
-    global _last_user_audio_ts
-    logger.info("🎤 Mic streaming active (64ms chunks)...")
+async def mic_loop(ws, mic):
+    global _last_audio
     loop = asyncio.get_running_loop()
-
     while True:
         try:
-            data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
+            data, _ = await loop.run_in_executor(None, mic.read, MIC_CHUNK)
             if data and not is_ai_speaking:
-                _last_user_audio_ts = _time.monotonic()
-                b64 = base64.b64encode(bytes(data)).decode("utf-8")
-                await ws.send(_dumps({
-                    "realtimeInput": {
-                        "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
-                    }
-                }))
-        except asyncio.CancelledError:
-            break
+                _last_audio = time.monotonic()
+                await ws.send(dumps({"realtimeInput":{"mediaChunks":[{"mimeType":"audio/pcm;rate=16000","data":base64.b64encode(bytes(data)).decode()}]}}))
+        except asyncio.CancelledError: return
         except Exception as e:
-            logger.warning(f"Mic error: {e}")
-            break
+            logger.warning("Mic loop stopped: %s", e); return
 
-# ---------------------------------------------------------------------------
-# Vision — Separate REST API call (not through the WebSocket)
-# ---------------------------------------------------------------------------
-_vision_http_session: aiohttp.ClientSession | None = None
+# ---------------- Gemini vision ----------------
+vision_session = None
+async def get_vision_session():
+    global vision_session
+    if vision_session is None or vision_session.closed:
+        vision_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12))
+    return vision_session
 
-async def _get_vision_session() -> aiohttp.ClientSession:
-    """Reused across every see_object call — skips repeated TLS/connect handshake to Ollama Cloud."""
-    global _vision_http_session
-    if _vision_http_session is None or _vision_http_session.closed:
-        _vision_http_session = aiohttp.ClientSession()
-    return _vision_http_session
-
-async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Analyze image via Ollama Cloud / REST API.
-
-    Returns a text description that gets put into the toolResponse.
-    Uses Ollama's /api/generate endpoint format.
-    """
-    url = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/") + "/api/generate"
-    ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
-    model = os.getenv("OLLAMA_VISION_MODEL", "") # Or your specific gemma model name
-
-    base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-    payload = {
-        "model": model,
-        "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
-        "images": [base64_img],
-        "stream": False
-    }
-
-    headers = {"Content-Type": "application/json"}
-    if ollama_api_key:
-        headers["Authorization"] = f"Bearer {ollama_api_key}"
-
+async def analyze_image(jpeg, prompt, key):
+    if not VISION_ENABLED: return "Vision is disabled."
+    if not key: return "GOOGLE_API_KEY is missing."
+    if not jpeg: return "No image captured."
+    model = os.getenv("GEMINI_VISION_MODEL", VISION_MODEL)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {"contents":[{"parts":[{"text":f"Describe what you see in 1-2 concise sentences. Focus on: {prompt or 'everything important in the scene.'}"},{"inlineData":{"mimeType":"image/jpeg","data":base64.b64encode(jpeg).decode()}}]}],"generationConfig":{"maxOutputTokens":100}}
     try:
-        session = await _get_vision_session()
-        t0 = _time.monotonic()
-        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                logger.info(f"👁️ Ollama vision call took {(_time.monotonic()-t0)*1000:.0f}ms (model={model})")
-                return data.get("response", "I looked, but couldn't recognize anything.")
-            else:
-                err = await resp.text()
-                logger.warning(f"Ollama Vision API error {resp.status}: {err[:200]}")
-                return "Could not analyze the image right now."
+        s = await get_vision_session()
+        t=time.monotonic()
+        async with s.post(url, params={"key":key}, json=payload) as r:
+            text=await r.text()
+            if r.status != 200:
+                logger.error("Gemini vision HTTP %s: %s", r.status, text[:500])
+                return f"Gemini vision error {r.status}: {text[:220]}"
+        d=json.loads(text)
+        parts=(d.get("candidates") or [{}])[0].get("content",{}).get("parts",[])
+        out=" ".join(p.get("text","") for p in parts if p.get("text")).strip()
+        logger.info("Vision %.0f ms (%s)", (time.monotonic()-t)*1000, model)
+        return out or "I could not recognize anything clearly."
     except Exception as e:
-        logger.warning(f"Ollama Vision API call failed: {e}")
-        return "Image analysis failed due to a network error."
+        logger.exception("Vision request failed")
+        return f"Image analysis failed: {e}"
 
-async def receive_messages_loop(ws, speaker_stream_tuple):
-    """Receives Gemini Live WebSocket messages (Audio, Camera requests & Tool Calls)."""
-    global is_ai_speaking, _first_ai_audio_ts, _ai_turn_started
-    speaker_stream, active_rate = speaker_stream_tuple
-    logger.info("🔊 Speaker listener active...")
-    loop = asyncio.get_running_loop()
-    need_resample = (active_rate == 48000)
+async def send_tool_response(ws, call_id, output):
+    await ws.send(dumps({"toolResponse":{"functionResponses":[{"response":{"output":str(output)},"id":call_id}]}}))
 
+async def handle_other_tool(call):
+    name=call.get("name"); args=call.get("args") or {}
+    if name == "see_object":
+        loop=asyncio.get_running_loop()
+        jpeg=await loop.run_in_executor(None,camera.grab)
+        if not jpeg: return "Failed to capture a photo from WALL-E's camera."
+        if ESP_IMAGE:
+            # Only use this if the ESP32 web UI really needs the image; it can add UART load.
+            try:
+                await loop.run_in_executor(None,send_uart_command,"IMG:"+base64.b64encode(jpeg).decode())
+            except Exception: pass
+        return await analyze_image(jpeg,args.get("prompt","Describe what you see."),os.getenv("GOOGLE_API_KEY",""))
+    func=TOOL_MAP.get(name)
+    if not func: return f"Unknown tool '{name}'"
     try:
-        async for message in ws:
-            data = _loads(message)
-
-            if "setupComplete" in data:
-                logger.info("🚀 Gemini Live Handshake Complete! Ready for speech.")
-                set_eye_state("EYES_NORMAL")
-
-            server_content = data.get("serverContent")
-            if server_content:
-                if server_content.get("interrupted"):
-                    is_ai_speaking = False
-                    _ai_turn_started = False
-                    set_eye_state("EYES_NORMAL")
-                    logger.info("⏹️ AI interrupted by user.")
-
-                model_turn = server_content.get("modelTurn")
-                if model_turn:
-                    parts = model_turn.get("parts", [])
-                    for part in parts:
-                        inline_data = part.get("inlineData")
-                        if inline_data and inline_data.get("data"):
-                            # Log first-byte latency (user audio → AI audio)
-                            if not _ai_turn_started:
-                                _ai_turn_started = True
-                                _first_ai_audio_ts = _time.monotonic()
-                                if _last_user_audio_ts > 0:
-                                    latency_ms = (_first_ai_audio_ts - _last_user_audio_ts) * 1000
-                                    logger.info(f"⚡ LATENCY: {latency_ms:.0f}ms (last mic chunk → first AI audio)")
-
-                            is_ai_speaking = True
-                            set_eye_state("EYES_TALKING")
-
-                            audio_bytes = base64.b64decode(inline_data["data"])
-                            if len(audio_bytes) % 2 != 0:
-                                audio_bytes = audio_bytes[:-1]
-
-                            if need_resample:
-                                audio_bytes = _resample_24k_to_48k(audio_bytes)
-
-                            if speaker_stream:
-                                await loop.run_in_executor(
-                                    None, speaker_stream.write, audio_bytes
-                                )
-
-                if server_content.get("turnComplete"):
-                    # Log total AI turn duration
-                    if _ai_turn_started and _first_ai_audio_ts > 0:
-                        turn_duration_ms = (_time.monotonic() - _first_ai_audio_ts) * 1000
-                        logger.info(f"🏁 AI turn complete ({turn_duration_ms:.0f}ms total speech)")
-                    is_ai_speaking = False
-                    _ai_turn_started = False
-                    set_eye_state("EYES_NORMAL")
-                    await loop.run_in_executor(None, send_uart_command, "IMG_CLEAR")
-
-            # Handle Tool Calls
-            tool_call = data.get("toolCall")
-            if tool_call:
-                set_eye_state("EYES_THINKING")
-                function_calls = tool_call.get("functionCalls", [])
-                for call in function_calls:
-                    fn_name = call.get("name")
-                    call_id = call.get("id")
-                    args = call.get("args", {})
-
-                    logger.info(f"🔧 Tool: {fn_name}({args})")
-
-                    # 📸 Camera Vision — separate REST API call
-                    #
-                    # WHY NOT clientContent or realtimeInput:
-                    # - clientContent creates permanent conversation turns
-                    #   containing the image + "describe" text, causing the
-                    #   model to re-trigger see_object in an infinite loop.
-                    # - realtimeInput corrupts the native-audio model's
-                    #   content type, causing 1007 WebSocket disconnects.
-                    #
-                    # SOLUTION: Use a separate Gemini REST API call to
-                    # analyze the image. Return the TEXT description in the
-                    # toolResponse. Zero protocol conflicts.
-                    if fn_name == "see_object":
-                        logger.info("📸 Capturing photo...")
-                        jpeg_bytes = await loop.run_in_executor(None, _camera.grab_jpeg)
-
-                        if jpeg_bytes:
-                            prompt_text = args.get("prompt", "Describe what you see.")
-
-                            # --- SEND THUMBNAIL TO ESP32 FOR WEB UI ---
-                            # cv2 decode/resize/encode is CPU-bound — run off the event
-                            # loop thread so it can't stall audio playback / mic reads
-                            # while it runs (was inline/blocking before).
-                            def _build_thumb(jb: bytes):
-                                import cv2, numpy as np
-                                arr = np.frombuffer(jb, np.uint8)
-                                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                                if img is None:
-                                    return None
-                                thumb = cv2.resize(img, (160, 120))
-                                ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
-                                return buf.tobytes() if ok else None
-
-                            try:
-                                thumb_bytes = await loop.run_in_executor(None, _build_thumb, jpeg_bytes)
-                                if thumb_bytes:
-                                    b64_thumb = base64.b64encode(thumb_bytes).decode('utf-8')
-                                    loop.run_in_executor(None, send_uart_command, f"IMG:{b64_thumb}")
-                            except Exception as e:
-                                logger.warning(f"Failed to send thumbnail to ESP32: {e}")
-
-                            # Analyze image via separate REST API call
-                            api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-                            description = await _analyze_image(jpeg_bytes, prompt_text, api_key)
-                            tool_result = description
-                            logger.info(f"✅ Photo analyzed ({len(jpeg_bytes)}B) → {description[:100]}")
-                        else:
-                            tool_result = "Failed to capture photo from camera."
-
-                    # Standard Tools Execution
-                    elif fn_name in TOOL_MAP:
-                        try:
-                            func = TOOL_MAP[fn_name]
-                            if inspect.iscoroutinefunction(func):
-                                tool_result = await func(**args)
-                            else:
-                                tool_result = func(**args)
-                        except Exception as e:
-                            tool_result = f"Error executing tool: {e}"
-                    else:
-                        tool_result = f"Unknown tool '{fn_name}'"
-
-                    # Send Tool Response Back
-                    await ws.send(_dumps({
-                        "toolResponse": {
-                            "functionResponses": [{
-                                "response": {"output": str(tool_result)},
-                                "id": call_id
-                            }]
-                        }
-                    }))
-                    logger.info(f"✅ Tool done: {tool_result[:80]}")
-
-                set_eye_state("EYES_NORMAL")
-
-    except asyncio.CancelledError:
-        pass
+        if inspect.iscoroutinefunction(func): return await func(**args)
+        return await asyncio.to_thread(func,**args)
     except Exception as e:
-        logger.warning(f"Receive loop error: {e}")
+        return f"Error executing tool: {e}"
 
-# ---------------------------------------------------------------------------
-# Main Execution Runner
-# ---------------------------------------------------------------------------
-async def run_direct_gemini_robot():
-    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        logger.error("❌ GOOGLE_API_KEY is missing in .env!")
-        return
+# ---------------- Receive / tool handling ----------------
+async def receive_loop(ws, speaker_info):
+    global is_ai_speaking, _turn_started
+    speaker, rate=speaker_info
+    loop=asyncio.get_running_loop(); need_resample=rate==48000
+    async for raw in ws:
+        try: data=loads(raw)
+        except Exception: continue
+        if "setupComplete" in data:
+            logger.info("Gemini Live ready")
+            eye("EYES_NORMAL")
+        sc=data.get("serverContent")
+        if sc:
+            if sc.get("interrupted"):
+                is_ai_speaking=False; _turn_started=False; eye("EYES_NORMAL")
+            mt=sc.get("modelTurn")
+            if mt:
+                for p in mt.get("parts",[]):
+                    x=p.get("inlineData")
+                    if x and x.get("data"):
+                        is_ai_speaking=True
+                        eye("EYES_TALKING")
+                        audio=base64.b64decode(x["data"])
+                        if len(audio)%2: audio=audio[:-1]
+                        if need_resample: audio=resample24to48(audio)
+                        if speaker: await loop.run_in_executor(None,speaker.write,audio)
+            if sc.get("turnComplete"):
+                is_ai_speaking=False; _turn_started=False; eye("EYES_NORMAL")
+                if ESP_IMAGE: await loop.run_in_executor(None,send_uart_command,"IMG_CLEAR")
+        tc=data.get("toolCall")
+        if not tc: continue
+        calls=tc.get("functionCalls",[])
+        # Movement gets the shortest possible path to UART.
+        moves=[c for c in calls if c.get("name")=="move_robot"]
+        others=[c for c in calls if c.get("name")!="move_robot"]
+        for c in moves:
+            cid=c.get("id",""); d=str((c.get("args") or {}).get("direction","STOP")).upper().strip()
+            if d in {"FORWARD","BACKWARD","LEFT","RIGHT","STOP"}:
+                ok=await loop.run_in_executor(None,send_uart_command,d)
+                result=("WALL-E stopped." if d=="STOP" else f"WALL-E moving {d}.") if ok else "ESP32 USB UART unavailable."
+            else: result=f"Invalid direction '{d}'."
+            await send_tool_response(ws,cid,result)
+        if others:
+            eye("THINK")
+            # Do not serialize unrelated tools unnecessarily; one at a time keeps tool ordering deterministic.
+            for c in others:
+                result=await handle_other_tool(c)
+                await send_tool_response(ws,c.get("id",""),result)
+            eye("EYES_NORMAL")
 
-    logger.info("⚡ Booting WALL-E (Ultra-Low Latency Mode)...")
-    set_eye_state("EYES_NORMAL")
-    
-    # Load past memory from memory.json (compact — max 20 most recent facts)
-    memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
-    past_memory_text = ""
-    if os.path.exists(memory_file):
-        try:
-            with open(memory_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    memories = json.loads(content)
-                    if isinstance(memories, list) and len(memories) > 0:
-                        # Only inject last 20 facts to keep system prompt small
-                        recent = memories[-20:]
-                        past_memory_text = "\n\nPAST MEMORIES:\n"
-                        for m in recent:
-                            if "fact" in m:
-                                past_memory_text += f"- {m['fact']}\n"
-                            elif "content" in m:
-                                past_memory_text += f"- {m['content']}\n"
-        except Exception as e:
-            logger.error(f"Failed to load memory: {e}")
-
-    final_instruction = AGENT_INSTRUCTION
-    if past_memory_text:
-        final_instruction += past_memory_text
-        logger.info("🧠 Loaded past memories.")
-
-    url = f"wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={api_key}"
-
-    setup_payload = {
-        "setup": {
-            "model": "models/gemini-2.5-flash-native-audio-preview-12-2025",
-            "generationConfig": {
-                "responseModalities": ["AUDIO"],
-                "speechConfig": {
-                    "voiceConfig": {
-                        "prebuiltVoiceConfig": {"voiceName": "Puck"}
-                    }
-                }
-            },
-            "systemInstruction": {
-                "parts": [{"text": final_instruction}]
-            },
-            "tools": [
-                {
-                    "functionDeclarations": [
-                        {
-                            "name": "remember_fact",
-                            "description": "Saves an important fact, reminder, or user detail to WALL-E's long-term memory.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "fact": {"type": "STRING", "description": "The information to remember."}
-                                },
-                                "required": ["fact"]
-                            }
-                        },
-                        {
-                            "name": "see_object",
-                            "description": "Captures a photo from WALL-E's camera and returns a description of what is visible. Use when user asks to look or see something.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "prompt": {"type": "STRING", "description": "What to analyze in the image"}
-                                }
-                            }
-                        },
-                        {
-                            "name": "move_robot",
-                            "description": "Controls WALL-E robot movement.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "direction": {
-                                        "type": "STRING",
-                                        "enum": ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]
-                                    }
-                                },
-                                "required": ["direction"]
-                            }
-                        },
-                        {
-                            "name": "get_weather",
-                            "description": "Fetches real-time weather for a city.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "city": {"type": "STRING"}
-                                }
-                            }
-                        },
-                        {
-                            "name": "get_time_info",
-                            "description": "Returns current time and date.",
-                            "parameters": {"type": "OBJECT", "properties": {}}
-                        },
-                        {
-                            "name": "search_web",
-                            "description": "Performs web search.",
-                            "parameters": {
-                                "type": "OBJECT",
-                                "properties": {
-                                    "query": {"type": "STRING"}
-                                },
-                                "required": ["query"]
-                            }
-                        }
-                    ]
-                }
-            ]
-        }
-    }
-
-    mic_stream = sd.RawInputStream(
-        samplerate=16000,
-        channels=1,
-        dtype='int16',
-        blocksize=MIC_CHUNK
-    )
-    mic_stream.start()
-    speaker_stream_info = _open_speaker_stream()
-
+async def run():
+    key=os.getenv("GOOGLE_API_KEY","").strip()
+    if not key:
+        logger.error("GOOGLE_API_KEY missing in .env"); return
+    memory=os.path.join(BASE,"memory.json")
+    memory_text=""
     try:
-        logger.info("📡 Connecting to Gemini Live WebSocket...")
-        async with websockets.connect(url) as ws:
-            logger.info("🚀 CONNECTED TO GEMINI LIVE!")
-
-            await ws.send(json.dumps(setup_payload))
-
-            send_task = asyncio.create_task(send_audio_loop(ws, mic_stream))
-            recv_task = asyncio.create_task(receive_messages_loop(ws, speaker_stream_info))
-
-            await asyncio.gather(send_task, recv_task)
-
+        if os.path.exists(memory):
+            with open(memory,encoding="utf-8") as f: m=json.load(f)
+            if isinstance(m,list): memory_text="\n\nPAST MEMORIES:\n"+"\n".join(f"- {x.get('fact') or x.get('content')}" for x in m[-20:] if isinstance(x,dict) and (x.get('fact') or x.get('content')))
+    except Exception: pass
+    instruction=AGENT_INSTRUCTION+memory_text
+    setup={"setup":{"model":LIVE_MODEL,"generationConfig":{"responseModalities":["AUDIO"],"speechConfig":{"voiceConfig":{"prebuiltVoiceConfig":{"voiceName":"Puck"}}}},"systemInstruction":{"parts":[{"text":instruction}]},"tools":[{"functionDeclarations":[
+        {"name":"move_robot","description":"Immediately controls WALL-E movement. Use for forward, backward, left, right, stop.","parameters":{"type":"OBJECT","properties":{"direction":{"type":"STRING","enum":["FORWARD","BACKWARD","LEFT","RIGHT","STOP"]}},"required":["direction"]}},
+        {"name":"see_object","description":"Captures a fresh camera frame and describes what WALL-E sees. Use whenever the user asks what you can see/look at.","parameters":{"type":"OBJECT","properties":{"prompt":{"type":"STRING","description":"What to inspect in the image"}}}},
+        {"name":"get_weather","description":"Gets current weather.","parameters":{"type":"OBJECT","properties":{"city":{"type":"STRING"}}}},
+        {"name":"get_time_info","description":"Gets current local time and date.","parameters":{"type":"OBJECT","properties":{}}},
+        {"name":"search_web","description":"Searches the web for a factual query.","parameters":{"type":"OBJECT","properties":{"query":{"type":"STRING"}},"required":["query"]}},
+        {"name":"remember_fact","description":"Stores an important fact in long-term memory.","parameters":{"type":"OBJECT","properties":{"fact":{"type":"STRING"}},"required":["fact"]}}
+    ]}]}}
+    mic=sd.RawInputStream(samplerate=16000,channels=1,dtype="int16",blocksize=MIC_CHUNK); mic.start()
+    speaker_info=open_speaker()
+    url="wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+key
+    try:
+        logger.info("WALL-E fast boot | Live=%s | Vision=%s (%s) | UART=%s",LIVE_MODEL,VISION_ENABLED,VISION_MODEL,os.getenv("SERIAL_PORT","/dev/ttyUSB0"))
+        eye("EYES_NORMAL")
+        async with websockets.connect(url,ping_interval=20,ping_timeout=20,close_timeout=1,max_size=4*1024*1024) as ws:
+            await ws.send(dumps(setup))
+            a=asyncio.create_task(mic_loop(ws,mic)); b=asyncio.create_task(receive_loop(ws,speaker_info))
+            done,_=await asyncio.wait({a,b},return_when=asyncio.FIRST_EXCEPTION)
+            for t in (a,b):
+                if not t.done(): t.cancel()
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.exception("Gemini Live connection failed: %s",e)
     finally:
-        mic_stream.stop()
-        mic_stream.close()
-        _camera.close()  # release persistent camera
-        if speaker_stream_info[0] is not None:
-            speaker_stream_info[0].stop()
-            speaker_stream_info[0].close()
-        set_eye_state("STOP")
+        try: mic.stop(); mic.close()
+        except Exception: pass
+        if speaker_info[0]:
+            try: speaker_info[0].stop(); speaker_info[0].close()
+            except Exception: pass
+        eye("STOP"); close_uart()
+        if vision_session and not vision_session.closed: await vision_session.close()
+        camera.close()
 
-if __name__ == "__main__":
-    try:
-        asyncio.run(run_direct_gemini_robot())
-    except KeyboardInterrupt:
-        logger.info("🛑 WALL-E Stopped.")
+if __name__=="__main__":
+    try: asyncio.run(run())
+    except KeyboardInterrupt: pass

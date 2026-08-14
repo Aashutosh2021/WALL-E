@@ -1,169 +1,168 @@
+"""WALL-E fast hardware/tools layer.
+USB ESP32 serial is the default because the ESP32 is connected to Raspberry Pi by USB.
 """
-WALL-E Tools — Hardware interface for ESP32 communication and Agent Tools.
-"""
-
-import os
-import logging
-import json
-import threading
-import aiohttp
+import os, json, time, logging, asyncio, threading
 from datetime import datetime
+from urllib.parse import quote
+import aiohttp
 
 logger = logging.getLogger(__name__)
+BASE = os.path.dirname(os.path.abspath(__file__))
+SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/ttyUSB0"))
+BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "115200")))
+ENABLE_ESP32_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {"1","true","yes","on"}
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ser = None
+_lock = threading.RLock()
 
-# ---------------------------------------------------------------------------
-# ESP32 USB Serial Communication
-# ---------------------------------------------------------------------------
-_ESP32_PORT = os.getenv("ESP32_PORT", "/dev/ttyUSB0")
-_ESP32_BAUD = 115200
 
-def _probe_usb_serial() -> bool:
-    """Check once at startup if ESP32 USB serial port is accessible."""
+def _open_serial_locked():
+    global _ser
+    if _ser is not None:
+        try:
+            if _ser.is_open:
+                return _ser
+        except Exception:
+            _ser = None
     try:
         import serial
-        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.5):
+        _ser = serial.Serial(
+            SERIAL_PORT, BAUD,
+            timeout=0.02,
+            write_timeout=0.05,
+            exclusive=False,
+        )
+        try:
+            _ser.reset_input_buffer()
+        except Exception:
             pass
-        logger.info(f"USB Serial Port ({_ESP32_PORT}) detected. Motor/Eye control enabled.")
-        return True
-    except Exception:
-        logger.info(f"USB Serial Port ({_ESP32_PORT}) not available. Motor/Eye control disabled.")
-        return False
-
-_USB_AVAILABLE: bool = _probe_usb_serial()
+        logger.info("ESP32 USB UART connected: %s @ %d", SERIAL_PORT, BAUD)
+        # USB serial opening can reset many ESP32 boards. Give firmware a moment.
+        time.sleep(0.25)
+        return _ser
+    except Exception as e:
+        logger.error("ESP32 USB UART unavailable (%s): %s", SERIAL_PORT, e)
+        _ser = None
+        return None
 
 
 def send_uart_command(command: str) -> bool:
-    """Sends command string to ESP32 over USB serial."""
-    if not _USB_AVAILABLE:
+    cmd = (command or "").strip()
+    if not cmd:
         return False
-    try:
-        import serial
-        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.1) as s:
-            s.write(f"{command}\n".encode('utf-8'))
-            logger.info(f"✅ USB Command Sent to ESP32: {command}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ USB Communication Error: {e}")
+    if cmd.startswith("IMG:") and not ENABLE_ESP32_IMAGE:
         return False
+    payload = (cmd + "\n").encode("utf-8")
+    with _lock:
+        ser = _open_serial_locked()
+        if ser is None:
+            return False
+        try:
+            ser.write(payload)
+            ser.flush()
+            logger.debug("UART TX: %s", cmd if not cmd.startswith("IMG:") else "IMG:<data>")
+            return True
+        except Exception as e:
+            logger.warning("UART write failed: %s", e)
+            try: ser.close()
+            except Exception: pass
+            globals()["_ser"] = None
+            return False
 
 
-# ---------------------------------------------------------------------------
-# Hardware & Software Tools
-# ---------------------------------------------------------------------------
+def close_uart():
+    global _ser
+    with _lock:
+        if _ser is not None:
+            try: _ser.close()
+            except Exception: pass
+            _ser = None
+
+
+VALID_DIRECTIONS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
+
 async def _move_robot(direction: str) -> str:
-    """Controls WALL-E movement via UART."""
-    dir_upper = direction.upper().strip()
-    valid = ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"]
-    if dir_upper not in valid:
-        return f"Invalid direction '{direction}'. Use: FORWARD, BACKWARD, LEFT, RIGHT, STOP."
-    send_uart_command(dir_upper)
-    return f"WALL-E moving {dir_upper}." if dir_upper != "STOP" else "WALL-E stopped."
+    d = (direction or "").upper().strip()
+    if d not in VALID_DIRECTIONS:
+        return f"Invalid direction '{direction}'. Use FORWARD, BACKWARD, LEFT, RIGHT, STOP."
+    ok = await asyncio.to_thread(send_uart_command, d)
+    if not ok:
+        return f"ESP32 USB UART unavailable. Could not send {d}."
+    return "WALL-E stopped." if d == "STOP" else f"WALL-E moving {d}."
 
-_http_session: aiohttp.ClientSession | None = None
-
-async def _get_session() -> aiohttp.ClientSession:
-    """Reuses one aiohttp session across calls — skips repeated TLS/connect handshake."""
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession()
-    return _http_session
+_http = None
+async def _session():
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+    return _http
 
 async def _get_weather(city: str = "") -> str:
-    """Fetches real-time weather. Auto-detects location from public IP address."""
     try:
-        sess = await _get_session()
-
-        # Step 1: Auto-detect location from IP
-        lat, lon, name, country = None, None, city or "Unknown", ""
+        s = await _session()
+        lat = lon = None
+        name, country = city or "your location", ""
         try:
-            async with sess.get("http://ip-api.com/json/?fields=lat,lon,city,country,status", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                geo = await r.json()
-            if geo.get("status") == "success":
-                lat = geo["lat"]
-                lon = geo["lon"]
-                name = geo.get("city", "your location")
-                country = geo.get("country", "")
+            async with s.get("http://ip-api.com/json/?fields=lat,lon,city,country,status") as r:
+                g = await r.json(content_type=None)
+                if g.get("status") == "success":
+                    lat, lon = g.get("lat"), g.get("lon")
+                    name, country = g.get("city") or name, g.get("country") or ""
         except Exception:
             pass
-
-        # Step 2: Fallback to city geocoding if IP detection failed
         if lat is None:
-            fallback_city = city or "Delhi"
-            async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={fallback_city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
-                geo = await r.json()
-            if not geo.get("results"):
-                return f"Could not detect location. City '{fallback_city}' not found."
-            loc = geo["results"][0]
-            lat, lon = loc["latitude"], loc["longitude"]
-            name = loc.get("name", fallback_city)
-            country = loc.get("country", "")
-
-        # Step 3: Fetch weather using lat/lon
-        async with sess.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=aiohttp.ClientTimeout(total=5)) as r:
+            q = city or "Delhi"
+            async with s.get("https://geocoding-api.open-meteo.com/v1/search", params={"name":q,"count":1,"language":"en","format":"json"}) as r:
+                g = await r.json()
+            if not g.get("results"):
+                return f"Could not find city '{q}'."
+            x = g["results"][0]
+            lat, lon = x["latitude"], x["longitude"]
+            name, country = x.get("name", q), x.get("country", "")
+        async with s.get("https://api.open-meteo.com/v1/forecast", params={"latitude":lat,"longitude":lon,"current_weather":"true"}) as r:
             w = await r.json()
-        curr = w.get("current_weather", {})
-        return f"Weather in {name}, {country}: {curr.get('temperature','N/A')}°C, Wind: {curr.get('windspeed','N/A')} km/h."
+        c = w.get("current_weather", {})
+        return f"Weather in {name}, {country}: {c.get('temperature','N/A')}°C, Wind: {c.get('windspeed','N/A')} km/h."
     except Exception as e:
         return f"Weather error: {e}"
 
 async def _get_time_info() -> str:
-    """Returns current time and date."""
-    now = datetime.now()
-    return f"Time: {now.strftime('%I:%M %p')}, Date: {now.strftime('%d %B %Y')} ({now.strftime('%A')})."
+    n = datetime.now()
+    return f"Time: {n:%I:%M %p}, Date: {n:%d %B %Y} ({n:%A})."
 
 async def _search_web(query: str) -> str:
-    """Lightweight web search via DuckDuckGo / Wikipedia."""
+    q = (query or "").strip()
+    if not q: return "Search query is empty."
     try:
-        sess = await _get_session()
-        async with sess.get(f"https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1", timeout=aiohttp.ClientTimeout(total=5)) as r:
+        s = await _session()
+        async with s.get("https://api.duckduckgo.com/", params={"q":q,"format":"json","no_html":1,"skip_disambig":1}) as r:
             if r.status == 200:
-                data = await r.json(content_type=None)
-                abstract = data.get("AbstractText", "").strip()
-                if abstract:
-                    return f"Search result: {abstract[:300]}"
-        async with sess.get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ','_')}", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                d = await r.json(content_type=None)
+                if d.get("AbstractText"):
+                    return "Search result: " + d["AbstractText"][:400]
+        async with s.get("https://en.wikipedia.org/api/rest_v1/page/summary/" + quote(q.replace(" ","_"))) as r:
             if r.status == 200:
-                data = await r.json()
-                extract = data.get("extract", "").strip()
-                if extract:
-                    return f"Wikipedia: {extract[:300]}"
-        return f"No summary found for '{query}'."
+                d = await r.json(content_type=None)
+                if d.get("extract"):
+                    return "Wikipedia: " + d["extract"][:400]
+        return f"No summary found for '{q}'."
     except Exception as e:
         return f"Search error: {e}"
 
 async def _remember_fact(fact: str) -> str:
-    """Saves an important fact or reminder to WALL-E's long-term memory."""
-    memory_file = os.path.join(_SCRIPT_DIR, "memory.json")
+    path = os.path.join(BASE, "memory.json")
     memories = []
-    if os.path.exists(memory_file):
-        try:
-            with open(memory_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    memories = json.loads(content)
-        except Exception as e:
-            logger.error(f"Failed to read memory.json: {e}")
-    
-    new_memory = {
-        "fact": fact,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
-    memories.append(new_memory)
-    
-    # Cap at 50 memories to prevent file bloat
-    if len(memories) > 50:
-        memories = memories[-50:]
-    
     try:
-        with open(memory_file, "w", encoding="utf-8") as f:
-            json.dump(memories, f, indent=2)
-        logger.info(f"🧠 Memory saved: {fact}")
-        return f"✅ Memorized: {fact}"
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f: memories = json.load(f)
+        if not isinstance(memories, list): memories = []
+    except Exception: memories = []
+    memories.append({"fact": fact, "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    try:
+        with open(path, "w", encoding="utf-8") as f: json.dump(memories[-50:], f, indent=2, ensure_ascii=False)
+        return f"Memorized: {fact}"
     except Exception as e:
-        logger.error(f"Failed to write to memory.json: {e}")
-        return f"❌ Failed to memorize: {e}"
+        return f"Failed to memorize: {e}"
 
 TOOL_MAP = {
     "move_robot": _move_robot,
