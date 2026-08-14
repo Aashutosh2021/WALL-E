@@ -991,13 +991,12 @@ async def run():
     setup = {
         "setup": {
             "model": LIVE_MODEL,
+            # Live API transcription settings are setup-level fields.
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
+
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
-
-                # Required for terminal transcript logging.
-                "inputAudioTranscription": {},
-                "outputAudioTranscription": {},
-
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
