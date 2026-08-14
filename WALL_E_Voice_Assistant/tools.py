@@ -5,6 +5,7 @@ WALL-E Tools — Hardware interface for ESP32 communication and Agent Tools.
 import os
 import logging
 import json
+import threading
 import aiohttp
 from datetime import datetime
 
@@ -13,44 +14,90 @@ logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
-# ESP32 USB Serial Communication
+# ESP32 Serial Communication — PERSISTENT connection
+#
+# WHY THIS CHANGED: the old code did `with serial.Serial(port, baud) as s:`
+# INSIDE send_uart_command(), i.e. opened a brand-new serial connection on
+# every single call. On the overwhelming majority of ESP32 dev boards
+# (CP2102/CH340/CH9102 USB-UART bridge with auto-program circuitry), opening
+# a serial port toggles DTR/RTS — which is wired straight to EN/GPIO0 on
+# those boards specifically so esptool/Arduino IDE can auto-reset+flash
+# without a manual boot-button press. Every eye-state change, every
+# IMG_CLEAR, every IMG: thumbnail send was almost certainly rebooting the
+# ESP32 (WiFi AP + web server re-init ~1-3s each). Several of those stack
+# per conversational turn — that's very likely your 5-7s (plain) / 5-10s
+# (vision, more UART calls in that path) lag, not network/model latency.
+#
+# Fix: open the port ONCE, keep it alive for the process lifetime, reuse it.
 # ---------------------------------------------------------------------------
-_ESP32_PORT = os.getenv("ESP32_PORT", "/dev/ttyUSB0")
-_ESP32_BAUD = 115200
+_ESP32_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/ttyUSB0")).strip("\"'")
+_ESP32_BAUD = int(os.getenv("BAUD_RATE", "115200"))
 
-_serial_conn = None
+_serial_conn = None          # persistent serial.Serial instance
+_serial_lock = threading.Lock()  # send_uart_command runs off run_in_executor from multiple call sites — serialize writes
 
-def _probe_usb_serial() -> bool:
-    """Check once at startup and KEEP THE PORT OPEN."""
+
+def _open_serial():
+    """Opens the persistent connection once. Returns True on success."""
     global _serial_conn
     try:
         import serial
-        # Open port once globally
-        _serial_conn = serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0)
-        # Prevent ESP32 from resetting on connection
-        _serial_conn.setDTR(False)
-        _serial_conn.setRTS(False)
-        logger.info(f"✅ USB Serial Port ({_ESP32_PORT}) opened permanently.")
+        conn = serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.2, write_timeout=0.5)
+        # Defensively deassert DTR/RTS right after open — on some platforms/
+        # adapters this avoids a second unwanted reset pulse post-open.
+        try:
+            conn.dtr = False
+            conn.rts = False
+        except Exception:
+            pass
+        _serial_conn = conn
+        logger.info(f"✅ Persistent serial connection opened on {_ESP32_PORT} @ {_ESP32_BAUD}. Motor/Eye control enabled.")
         return True
     except Exception as e:
-        logger.info(f"❌ USB Serial Port not available: {e}")
+        logger.info(f"Serial port ({_ESP32_PORT}) not available — Motor/Eye control disabled. ({e})")
+        _serial_conn = None
         return False
 
-_USB_AVAILABLE: bool = _probe_usb_serial()
+
+_USB_AVAILABLE: bool = _open_serial()
+
 
 def send_uart_command(command: str) -> bool:
-    """Sends command string to ESP32 over ALREADY OPEN USB serial."""
+    """Sends command string to ESP32 over the persistent serial connection.
+    Thread-safe (called via run_in_executor from several places — eye state,
+    IMG thumbnails, IMG_CLEAR — which can overlap)."""
+    global _serial_conn, _USB_AVAILABLE
+
+    with _serial_lock:
+        if _serial_conn is None:
+            # Lost connection (ESP32 power-cycled, cable unplugged, etc.) — try once to recover.
+            if not _open_serial():
+                return False
+
+        try:
+            _serial_conn.write(f"{command}\n".encode("utf-8"))
+            _serial_conn.flush()
+            logger.info(f"✅ UART Command Sent: {command}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ UART write failed, will reconnect next call: {e}")
+            try:
+                _serial_conn.close()
+            except Exception:
+                pass
+            _serial_conn = None
+            return False
+
+
+def close_uart():
+    """Call on clean shutdown to release the port."""
     global _serial_conn
-    if not _USB_AVAILABLE or not _serial_conn:
-        return False
-    try:
-        _serial_conn.write(f"{command}\n".encode('utf-8'))
-        _serial_conn.flush() # Ensure data is pushed immediately
-        logger.info(f"⚡ USB Command Sent: {command}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ USB Comm Error: {e}")
-        return False
+    if _serial_conn is not None:
+        try:
+            _serial_conn.close()
+        except Exception:
+            pass
+        _serial_conn = None
 
 
 # ---------------------------------------------------------------------------

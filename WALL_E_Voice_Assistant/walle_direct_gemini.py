@@ -255,36 +255,23 @@ def _open_speaker_stream():
 # ---------------------------------------------------------------------------
 MIC_CHUNK = 1024  # 64ms at 16kHz — half the old 128ms for faster voice detection
 
-# Noise Gate Threshold: Agar mic volume isse kam hai, toh audio send mat karo
-# Ise apne room noise ke hisab se 100 se 500 ke beech adjust kar lena
-SILENCE_THRESHOLD = 300 
-
 async def send_audio_loop(ws, mic_stream):
-    """Streams recorded microphone PCM audio with RMS Noise Gating."""
+    """Streams recorded microphone PCM audio chunks over WebSocket."""
     global _last_user_audio_ts
-    logger.info("🎤 Mic streaming active (Noise Gate ON)...")
+    logger.info("🎤 Mic streaming active (64ms chunks)...")
     loop = asyncio.get_running_loop()
 
     while True:
         try:
             data, _ = await loop.run_in_executor(None, mic_stream.read, MIC_CHUNK)
             if data and not is_ai_speaking:
-                
-                # Math: Calculate volume (Root Mean Square) of the chunk
-                audio_np = np.frombuffer(bytes(data), dtype=np.int16)
-                rms = np.sqrt(np.mean(np.square(audio_np.astype(np.float32))))
-                
-                # Agar awaz threshold se badi hai tabhi bhejenge
-                if rms > SILENCE_THRESHOLD:
-                    _last_user_audio_ts = _time.monotonic()
-                    b64 = base64.b64encode(bytes(data)).decode("utf-8")
-                    await ws.send(_dumps({
-                        "realtimeInput": {
-                            "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
-                        }
-                    }))
-                # Agar chuupi (silence) hai, toh frame DROP ho jayega aur Gemini jaldi reply dega.
-                
+                _last_user_audio_ts = _time.monotonic()
+                b64 = base64.b64encode(bytes(data)).decode("utf-8")
+                await ws.send(_dumps({
+                    "realtimeInput": {
+                        "mediaChunks": [{"mimeType": "audio/pcm;rate=16000", "data": b64}]
+                    }
+                }))
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -294,37 +281,51 @@ async def send_audio_loop(ws, mic_stream):
 # ---------------------------------------------------------------------------
 # Vision — Separate REST API call (not through the WebSocket)
 # ---------------------------------------------------------------------------
+_vision_http_session: aiohttp.ClientSession | None = None
+
+async def _get_vision_session() -> aiohttp.ClientSession:
+    """Reused across every see_object call — skips repeated TLS/connect handshake to Ollama Cloud."""
+    global _vision_http_session
+    if _vision_http_session is None or _vision_http_session.closed:
+        _vision_http_session = aiohttp.ClientSession()
+    return _vision_http_session
+
 async def _analyze_image(jpeg_bytes: bytes, prompt: str, api_key: str) -> str:
-    """Analyze image using Ultra-Fast Gemini Flash REST API (Takes ~1.5s)"""
-    # Use Gemini Flash for blazing fast vision
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    """Analyze image via Ollama Cloud / REST API.
+
+    Returns a text description that gets put into the toolResponse.
+    Uses Ollama's /api/generate endpoint format.
+    """
+    url = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/") + "/api/generate"
+    ollama_api_key = os.getenv("OLLAMA_API_KEY", "").strip()
+    model = os.getenv("OLLAMA_VISION_MODEL", "") # Or your specific gemma model name
+
     base64_img = base64.b64encode(jpeg_bytes).decode("utf-8")
-    
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": f"Briefly describe what you see (2 short sentences). Focus on: {prompt}"},
-                {"inline_data": {"mime_type": "image/jpeg", "data": base64_img}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.4} # Low temp for fast, factual response
+        "model": model,
+        "prompt": f"Briefly describe what you see in this image (2-3 short sentences). Focus on: {prompt}",
+        "images": [base64_img],
+        "stream": False
     }
-    
+
     headers = {"Content-Type": "application/json"}
-    
+    if ollama_api_key:
+        headers["Authorization"] = f"Bearer {ollama_api_key}"
+
     try:
-        async with aiohttp.ClientSession() as session:
-            # Shortened timeout to 5 seconds
-            async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                else:
-                    err = await resp.text()
-                    logger.warning(f"Gemini Vision API error: {err[:200]}")
-                    return "Could not analyze the image right now."
+        session = await _get_vision_session()
+        t0 = _time.monotonic()
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                logger.info(f"👁️ Ollama vision call took {(_time.monotonic()-t0)*1000:.0f}ms (model={model})")
+                return data.get("response", "I looked, but couldn't recognize anything.")
+            else:
+                err = await resp.text()
+                logger.warning(f"Ollama Vision API error {resp.status}: {err[:200]}")
+                return "Could not analyze the image right now."
     except Exception as e:
-        logger.warning(f"Vision API network error: {e}")
+        logger.warning(f"Ollama Vision API call failed: {e}")
         return "Image analysis failed due to a network error."
 
 async def receive_messages_loop(ws, speaker_stream_tuple):
@@ -422,16 +423,24 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                             prompt_text = args.get("prompt", "Describe what you see.")
 
                             # --- SEND THUMBNAIL TO ESP32 FOR WEB UI ---
-                            try:
+                            # cv2 decode/resize/encode is CPU-bound — run off the event
+                            # loop thread so it can't stall audio playback / mic reads
+                            # while it runs (was inline/blocking before).
+                            def _build_thumb(jb: bytes):
                                 import cv2, numpy as np
-                                arr = np.frombuffer(jpeg_bytes, np.uint8)
+                                arr = np.frombuffer(jb, np.uint8)
                                 img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                                if img is not None:
-                                    thumb = cv2.resize(img, (160, 120))
-                                    ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
-                                    if ok:
-                                        b64_thumb = base64.b64encode(buf.tobytes()).decode('utf-8')
-                                        loop.run_in_executor(None, send_uart_command, f"IMG:{b64_thumb}")
+                                if img is None:
+                                    return None
+                                thumb = cv2.resize(img, (160, 120))
+                                ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
+                                return buf.tobytes() if ok else None
+
+                            try:
+                                thumb_bytes = await loop.run_in_executor(None, _build_thumb, jpeg_bytes)
+                                if thumb_bytes:
+                                    b64_thumb = base64.b64encode(thumb_bytes).decode('utf-8')
+                                    loop.run_in_executor(None, send_uart_command, f"IMG:{b64_thumb}")
                             except Exception as e:
                                 logger.warning(f"Failed to send thumbnail to ESP32: {e}")
 
@@ -457,7 +466,7 @@ async def receive_messages_loop(ws, speaker_stream_tuple):
                         tool_result = f"Unknown tool '{fn_name}'"
 
                     # Send Tool Response Back
-                    await ws.send(json.dumps({
+                    await ws.send(_dumps({
                         "toolResponse": {
                             "functionResponses": [{
                                 "response": {"output": str(tool_result)},
