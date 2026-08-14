@@ -14,90 +14,39 @@ logger = logging.getLogger(__name__)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
-# ESP32 Serial Communication — PERSISTENT connection
-#
-# WHY THIS CHANGED: the old code did `with serial.Serial(port, baud) as s:`
-# INSIDE send_uart_command(), i.e. opened a brand-new serial connection on
-# every single call. On the overwhelming majority of ESP32 dev boards
-# (CP2102/CH340/CH9102 USB-UART bridge with auto-program circuitry), opening
-# a serial port toggles DTR/RTS — which is wired straight to EN/GPIO0 on
-# those boards specifically so esptool/Arduino IDE can auto-reset+flash
-# without a manual boot-button press. Every eye-state change, every
-# IMG_CLEAR, every IMG: thumbnail send was almost certainly rebooting the
-# ESP32 (WiFi AP + web server re-init ~1-3s each). Several of those stack
-# per conversational turn — that's very likely your 5-7s (plain) / 5-10s
-# (vision, more UART calls in that path) lag, not network/model latency.
-#
-# Fix: open the port ONCE, keep it alive for the process lifetime, reuse it.
+# ESP32 USB Serial Communication
 # ---------------------------------------------------------------------------
-_ESP32_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/ttyUSB0")).strip("\"'")
-_ESP32_BAUD = int(os.getenv("BAUD_RATE", "115200"))
+_ESP32_PORT = os.getenv("ESP32_PORT", "/dev/ttyUSB0")
+_ESP32_BAUD = 115200
 
-_serial_conn = None          # persistent serial.Serial instance
-_serial_lock = threading.Lock()  # send_uart_command runs off run_in_executor from multiple call sites — serialize writes
-
-
-def _open_serial():
-    """Opens the persistent connection once. Returns True on success."""
-    global _serial_conn
+def _probe_usb_serial() -> bool:
+    """Check once at startup if ESP32 USB serial port is accessible."""
     try:
         import serial
-        conn = serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.2, write_timeout=0.5)
-        # Defensively deassert DTR/RTS right after open — on some platforms/
-        # adapters this avoids a second unwanted reset pulse post-open.
-        try:
-            conn.dtr = False
-            conn.rts = False
-        except Exception:
+        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.5):
             pass
-        _serial_conn = conn
-        logger.info(f"✅ Persistent serial connection opened on {_ESP32_PORT} @ {_ESP32_BAUD}. Motor/Eye control enabled.")
+        logger.info(f"USB Serial Port ({_ESP32_PORT}) detected. Motor/Eye control enabled.")
         return True
-    except Exception as e:
-        logger.info(f"Serial port ({_ESP32_PORT}) not available — Motor/Eye control disabled. ({e})")
-        _serial_conn = None
+    except Exception:
+        logger.info(f"USB Serial Port ({_ESP32_PORT}) not available. Motor/Eye control disabled.")
         return False
 
-
-_USB_AVAILABLE: bool = _open_serial()
+_USB_AVAILABLE: bool = _probe_usb_serial()
 
 
 def send_uart_command(command: str) -> bool:
-    """Sends command string to ESP32 over the persistent serial connection.
-    Thread-safe (called via run_in_executor from several places — eye state,
-    IMG thumbnails, IMG_CLEAR — which can overlap)."""
-    global _serial_conn, _USB_AVAILABLE
-
-    with _serial_lock:
-        if _serial_conn is None:
-            # Lost connection (ESP32 power-cycled, cable unplugged, etc.) — try once to recover.
-            if not _open_serial():
-                return False
-
-        try:
-            _serial_conn.write(f"{command}\n".encode("utf-8"))
-            _serial_conn.flush()
-            logger.info(f"✅ UART Command Sent: {command}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ UART write failed, will reconnect next call: {e}")
-            try:
-                _serial_conn.close()
-            except Exception:
-                pass
-            _serial_conn = None
-            return False
-
-
-def close_uart():
-    """Call on clean shutdown to release the port."""
-    global _serial_conn
-    if _serial_conn is not None:
-        try:
-            _serial_conn.close()
-        except Exception:
-            pass
-        _serial_conn = None
+    """Sends command string to ESP32 over USB serial."""
+    if not _USB_AVAILABLE:
+        return False
+    try:
+        import serial
+        with serial.Serial(_ESP32_PORT, _ESP32_BAUD, timeout=0.1) as s:
+            s.write(f"{command}\n".encode('utf-8'))
+            logger.info(f"✅ USB Command Sent to ESP32: {command}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ USB Communication Error: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +70,37 @@ async def _get_session() -> aiohttp.ClientSession:
         _http_session = aiohttp.ClientSession()
     return _http_session
 
-async def _get_weather(city: str = "Delhi") -> str:
-    """Fetches real-time weather from Open-Meteo."""
+async def _get_weather(city: str = "") -> str:
+    """Fetches real-time weather. Auto-detects location from public IP address."""
     try:
         sess = await _get_session()
-        async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
-            geo = await r.json()
-        if not geo.get("results"):
-            return f"City '{city}' not found."
-        loc = geo["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        name = loc.get("name", city)
-        country = loc.get("country", "")
+
+        # Step 1: Auto-detect location from IP
+        lat, lon, name, country = None, None, city or "Unknown", ""
+        try:
+            async with sess.get("http://ip-api.com/json/?fields=lat,lon,city,country,status", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                geo = await r.json()
+            if geo.get("status") == "success":
+                lat = geo["lat"]
+                lon = geo["lon"]
+                name = geo.get("city", "your location")
+                country = geo.get("country", "")
+        except Exception:
+            pass
+
+        # Step 2: Fallback to city geocoding if IP detection failed
+        if lat is None:
+            fallback_city = city or "Delhi"
+            async with sess.get(f"https://geocoding-api.open-meteo.com/v1/search?name={fallback_city}&count=1&language=en&format=json", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                geo = await r.json()
+            if not geo.get("results"):
+                return f"Could not detect location. City '{fallback_city}' not found."
+            loc = geo["results"][0]
+            lat, lon = loc["latitude"], loc["longitude"]
+            name = loc.get("name", fallback_city)
+            country = loc.get("country", "")
+
+        # Step 3: Fetch weather using lat/lon
         async with sess.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=aiohttp.ClientTimeout(total=5)) as r:
             w = await r.json()
         curr = w.get("current_weather", {})
