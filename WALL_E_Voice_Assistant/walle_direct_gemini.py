@@ -133,27 +133,136 @@ _audio_worker = None
 _audio_stream = None
 _audio_playback_started = threading.Event()
 
-# 24 kHz mono int16: 2400 samples ~= 100 ms. We prebuffer this much before
-# the first write, then feed fixed-size blocks to ALSA. This eliminates the
-# repeated tiny-write underruns seen on Raspberry Pi while adding only ~100 ms
-# of output startup buffering.
-_AUDIO_BLOCK_SAMPLES_24K = 2400
-_AUDIO_BYTES_PER_BLOCK_24K = _AUDIO_BLOCK_SAMPLES_24K * 2
+# 24 kHz mono int16: 960 samples = 40 ms. This is the target write size to
+# ALSA — large enough to avoid per-write overhead, small enough to match the
+# typical Gemini audio packet cadence and keep latency low.
+_WRITE_SAMPLES = 960
+_WRITE_BYTES = _WRITE_SAMPLES * 2  # int16 = 2 bytes/sample
+
+# Prebuffer ~80 ms (1920 samples) before the very first ALSA write so the
+# device ring buffer has enough data to start without an immediate underrun.
+_PREBUF_BYTES = _WRITE_SAMPLES * 2 * 2  # 2 blocks = 80 ms
+
+# Audio pipeline diagnostics (updated by the worker, read at turn-complete).
+_audio_stats_lock = threading.Lock()
+_audio_stats = {
+    "writes": 0,
+    "write_bytes": 0,
+    "write_time_ms": 0.0,
+    "max_write_ms": 0.0,
+    "underruns": 0,
+    "queue_peak": 0,
+    "queue_waits": 0,
+    "rx_chunks": 0,
+    "rx_bytes": 0,
+    "dropped": 0,
+    "last_report": 0.0,
+}
+
+
+def _reset_audio_stats():
+    with _audio_stats_lock:
+        for k in _audio_stats:
+            if k == "last_report":
+                _audio_stats[k] = time.monotonic()
+            else:
+                _audio_stats[k] = 0 if isinstance(_audio_stats[k], int) else 0.0
+
+
+def _report_audio_stats(force=False):
+    """Log aggregate audio stats every ~2 seconds during playback."""
+    with _audio_stats_lock:
+        now = time.monotonic()
+        if not force and (now - _audio_stats["last_report"]) < 2.0:
+            return
+        if _audio_stats["writes"] == 0 and not force:
+            return
+        s = dict(_audio_stats)
+        _audio_stats["last_report"] = now
+
+    avg_write = (s["write_time_ms"] / s["writes"]) if s["writes"] else 0
+    logger.info(
+        "📊 AUDIO STATS | writes=%d | bytes=%d | avg_write=%.1fms | "
+        "max_write=%.1fms | underruns=%d | q_peak=%d | q_waits=%d | "
+        "rx_chunks=%d | rx_bytes=%d | dropped=%d",
+        s["writes"], s["write_bytes"], avg_write, s["max_write_ms"],
+        s["underruns"], s["queue_peak"], s["queue_waits"],
+        s["rx_chunks"], s["rx_bytes"], s["dropped"],
+    )
 
 
 def _audio_worker_loop():
-    """Dedicated ALSA consumer with PCM aggregation/prebuffering."""
+    """Dedicated ALSA consumer — writes consistent ~40ms PCM blocks.
+
+    Key design decisions that prevent ALSA underruns on Pi 3B+:
+    1. Prebuffer 80ms before the first write so ALSA's ring buffer has data.
+    2. Write in fixed ~960-sample (40ms) blocks — never micro-writes.
+    3. Poll the queue every 5ms (not 50ms) so ALSA never starves.
+    4. When the queue goes empty during playback, flush whatever remains
+       in 'pending' so there is no trailing silence gap.
+    """
     global _audio_stream
 
     pending = bytearray()
     started = False
 
+    def _write_block(data_bytes):
+        """Write one block to the ALSA device and track stats."""
+        nonlocal started
+        stream = _audio_stream
+        if stream is None:
+            return False
+        t0 = time.monotonic()
+        try:
+            stream.write(data_bytes)
+            elapsed = (time.monotonic() - t0) * 1000
+            started = True
+            with _audio_stats_lock:
+                _audio_stats["writes"] += 1
+                _audio_stats["write_bytes"] += len(data_bytes)
+                _audio_stats["write_time_ms"] += elapsed
+                if elapsed > _audio_stats["max_write_ms"]:
+                    _audio_stats["max_write_ms"] = elapsed
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "underrun" in err_str.lower() or "Underrun" in err_str:
+                with _audio_stats_lock:
+                    _audio_stats["underruns"] += 1
+                # Underrun recovery: ALSA auto-recovers, just keep writing.
+                return True
+            logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
+            return False
+
+    def _drain_pending():
+        """Write as many full blocks from 'pending' as possible."""
+        while len(pending) >= _WRITE_BYTES:
+            block = bytes(pending[:_WRITE_BYTES])
+            del pending[:_WRITE_BYTES]
+            if not _write_block(block):
+                pending.clear()
+                return False
+        return True
+
     while not _audio_stop.is_set():
         try:
-            item = _audio_queue.get(timeout=0.05)
+            item = _audio_queue.get(timeout=0.005)  # 5ms — keeps ALSA fed
         except queue.Empty:
-            # If playback has started and there is a short network gap, do not
-            # spin; ALSA's own buffering handles the normal cadence.
+            with _audio_stats_lock:
+                _audio_stats["queue_waits"] += 1
+
+            # Queue is empty but we have leftover PCM from a previous packet.
+            # Flush it NOW instead of letting ALSA starve waiting for more.
+            if started and len(pending) > 0:
+                # Pad to even sample boundary (int16 = 2 bytes)
+                if len(pending) % 2:
+                    pending.append(0)
+                if len(pending) > 0:
+                    block = bytes(pending)
+                    pending.clear()
+                    _write_block(block)
+
+            _report_audio_stats()
             continue
 
         if item is None:
@@ -162,36 +271,29 @@ def _audio_worker_loop():
         try:
             pending.extend(item)
 
-            # Wait for ~100 ms of PCM before the first device write.
-            target = _AUDIO_BYTES_PER_BLOCK_24K if not started else 1
+            # Track queue depth
+            qsize = _audio_queue.qsize()
+            with _audio_stats_lock:
+                if qsize > _audio_stats["queue_peak"]:
+                    _audio_stats["queue_peak"] = qsize
 
-            while len(pending) >= target:
-                stream = _audio_stream
-                if stream is None:
-                    pending.clear()
-                    break
+            if not started:
+                # Prebuffer: wait until we have ≥80ms before the first write.
+                if len(pending) < _PREBUF_BYTES:
+                    continue
 
-                block_size = (
-                    _AUDIO_BYTES_PER_BLOCK_24K
-                    if len(pending) >= _AUDIO_BYTES_PER_BLOCK_24K
-                    else len(pending)
-                )
-                block = bytes(pending[:block_size])
-                del pending[:block_size]
-
-                try:
-                    stream.write(block)
-                    started = True
-                except Exception as e:
-                    logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
-                    pending.clear()
-                    break
-
-                target = 1
+            # Write full blocks.
+            if not _drain_pending():
+                started = False
 
         finally:
             _audio_queue.task_done()
 
+    # Shutdown: flush anything remaining.
+    if len(pending) > 0 and _audio_stream is not None:
+        if len(pending) % 2:
+            pending.append(0)
+        _write_block(bytes(pending))
     pending.clear()
 
 
@@ -516,21 +618,45 @@ def eye(state):
 # ---------------------------------------------------------------------------
 
 def open_speaker():
-    # Gemini Live PCM is 24 kHz mono int16. Use a moderately sized ALSA
-    # buffer so network jitter does not repeatedly underrun the device.
-    # 48000 Hz is only used as a fallback with explicit 2x resampling.
+    # Gemini Live PCM is 24 kHz mono int16.
+    #
+    # KEY DESIGN DECISIONS to prevent ALSA underruns on Pi 3B+:
+    #
+    # 1. Do NOT set blocksize. With blocksize set, PortAudio's blocking-write
+    #    API only accepts writes aligned to that blocksize, causing the audio
+    #    worker's variable-size writes to trigger partial fills → underruns.
+    #    Without blocksize, ALSA accepts whatever we give it immediately.
+    #
+    # 2. Use latency=0.1 (100ms ring buffer), NOT "high" (~500ms+). A 100ms
+    #    buffer is large enough to absorb network jitter and Python GIL
+    #    scheduling, but small enough to keep perceived playback latency low.
+    #
+    # 3. 48000 Hz is only a fallback with explicit 2x sample replication.
     for rate in (24000, 48000):
         try:
             s = sd.RawOutputStream(
                 samplerate=rate,
                 channels=1,
                 dtype="int16",
-                blocksize=2400 if rate == 24000 else 4800,
-                latency="high",
+                latency=0.1,  # 100ms ALSA ring buffer
             )
             s.start()
-            logger.info("🔊 Speaker READY | %d Hz | block=%d | latency=high",
-                        rate, 2400 if rate == 24000 else 4800)
+
+            # Log actual device parameters for diagnostics.
+            try:
+                dev_info = sd.query_devices(s.device, "output")
+                logger.info(
+                    "🔊 Speaker READY | %d Hz | latency=100ms | "
+                    "device='%s' | host_api=%s | "
+                    "default_low_latency=%.1fms | default_high_latency=%.1fms",
+                    rate,
+                    dev_info.get("name", "unknown"),
+                    dev_info.get("hostapi", "?"),
+                    dev_info.get("default_low_output_latency", 0) * 1000,
+                    dev_info.get("default_high_output_latency", 0) * 1000,
+                )
+            except Exception:
+                logger.info("🔊 Speaker READY | %d Hz | latency=100ms", rate)
             return s, rate
         except Exception as e:
             logger.warning("🔊 Speaker open failed | rate=%d | %s", rate, e)
@@ -958,6 +1084,7 @@ async def receive_loop(ws, speaker_info):
                         _image_analysis_active = False
                         _image_analysis_completed = False
                         logger.info("🎤 USER TURN START [%s]", _stamp())
+                        _reset_audio_stats()
 
                     _user_transcript_parts.append(text)
                     logger.info(
@@ -1041,11 +1168,16 @@ async def receive_loop(ws, speaker_info):
                             # Never write to ALSA from the Gemini WebSocket
                             # receive coroutine. Queue it for the dedicated
                             # playback worker.
+                            with _audio_stats_lock:
+                                _audio_stats["rx_chunks"] += 1
+                                _audio_stats["rx_bytes"] += len(audio)
                             try:
                                 _audio_queue.put_nowait(audio)
                             except queue.Full:
                                 # Stale audio is worse than dropping one chunk:
                                 # keep the robot responsive to the current turn.
+                                with _audio_stats_lock:
+                                    _audio_stats["dropped"] += 1
                                 try:
                                     _audio_queue.get_nowait()
                                     _audio_queue.task_done()
@@ -1130,12 +1262,12 @@ async def receive_loop(ws, speaker_info):
 
                 logger.info(
                     "📊 TURN STATS | user=%d chars | ai=%d chars | "
-                    "audio_queue=%d | mic_continuous=True | "
-                    "NOTE=turn-complete includes full AI audio playback",
+                    "audio_queue=%d | mic_continuous=True",
                     len(user_text),
                     len(ai_text),
                     _audio_queue.qsize(),
                 )
+                _report_audio_stats(force=True)
 
                 _image_analysis_active = False
                 _image_analysis_completed = False
