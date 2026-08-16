@@ -1,7 +1,7 @@
 """WALL-E fast hardware/tools layer.
 
 ESP32 is connected to Raspberry Pi by USB.
-Default serial device: /dev/ttyUSB0.
+Default serial device: /dev/serial0.
 
 The UART connection is persistent for low latency. A background reader
 prints ESP32 ACK/log lines without blocking movement commands.
@@ -22,8 +22,8 @@ logger = logging.getLogger("WALLE")
 
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/ttyUSB0"))
-BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "115200")))
+SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/serial0"))
+BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "9600")))
 ENABLE_ESP32_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {
     "1", "true", "yes", "on"
 }
