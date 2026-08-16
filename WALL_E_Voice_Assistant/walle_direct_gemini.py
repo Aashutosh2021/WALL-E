@@ -133,28 +133,66 @@ _audio_worker = None
 _audio_stream = None
 _audio_playback_started = threading.Event()
 
+# 24 kHz mono int16: 2400 samples ~= 100 ms. We prebuffer this much before
+# the first write, then feed fixed-size blocks to ALSA. This eliminates the
+# repeated tiny-write underruns seen on Raspberry Pi while adding only ~100 ms
+# of output startup buffering.
+_AUDIO_BLOCK_SAMPLES_24K = 2400
+_AUDIO_BYTES_PER_BLOCK_24K = _AUDIO_BLOCK_SAMPLES_24K * 2
+
 
 def _audio_worker_loop():
-    """Dedicated ALSA consumer. Never block the Gemini WebSocket reader."""
+    """Dedicated ALSA consumer with PCM aggregation/prebuffering."""
     global _audio_stream
+
+    pending = bytearray()
+    started = False
 
     while not _audio_stop.is_set():
         try:
-            item = _audio_queue.get(timeout=0.10)
+            item = _audio_queue.get(timeout=0.05)
         except queue.Empty:
+            # If playback has started and there is a short network gap, do not
+            # spin; ALSA's own buffering handles the normal cadence.
             continue
 
         if item is None:
             break
 
         try:
-            stream = _audio_stream
-            if stream is not None:
-                stream.write(item)
-        except Exception as e:
-            logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
+            pending.extend(item)
+
+            # Wait for ~100 ms of PCM before the first device write.
+            target = _AUDIO_BYTES_PER_BLOCK_24K if not started else 1
+
+            while len(pending) >= target:
+                stream = _audio_stream
+                if stream is None:
+                    pending.clear()
+                    break
+
+                block_size = (
+                    _AUDIO_BYTES_PER_BLOCK_24K
+                    if len(pending) >= _AUDIO_BYTES_PER_BLOCK_24K
+                    else len(pending)
+                )
+                block = bytes(pending[:block_size])
+                del pending[:block_size]
+
+                try:
+                    stream.write(block)
+                    started = True
+                except Exception as e:
+                    logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
+                    pending.clear()
+                    break
+
+                target = 1
+
         finally:
             _audio_queue.task_done()
+
+    pending.clear()
 
 
 def start_audio_worker(stream):
@@ -478,18 +516,24 @@ def eye(state):
 # ---------------------------------------------------------------------------
 
 def open_speaker():
+    # Gemini Live PCM is 24 kHz mono int16. Use a moderately sized ALSA
+    # buffer so network jitter does not repeatedly underrun the device.
+    # 48000 Hz is only used as a fallback with explicit 2x resampling.
     for rate in (24000, 48000):
         try:
             s = sd.RawOutputStream(
                 samplerate=rate,
                 channels=1,
                 dtype="int16",
+                blocksize=2400 if rate == 24000 else 4800,
+                latency="high",
             )
             s.start()
-            logger.info("🔊 Speaker READY | %d Hz", rate)
+            logger.info("🔊 Speaker READY | %d Hz | block=%d | latency=high",
+                        rate, 2400 if rate == 24000 else 4800)
             return s, rate
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("🔊 Speaker open failed | rate=%d | %s", rate, e)
 
     logger.warning("🔊 Speaker stream unavailable")
     return None, 24000
@@ -1086,7 +1130,8 @@ async def receive_loop(ws, speaker_info):
 
                 logger.info(
                     "📊 TURN STATS | user=%d chars | ai=%d chars | "
-                    "audio_queue=%d | mic_continuous=True",
+                    "audio_queue=%d | mic_continuous=True | "
+                    "NOTE=turn-complete includes full AI audio playback",
                     len(user_text),
                     len(ai_text),
                     _audio_queue.qsize(),
@@ -1243,7 +1288,13 @@ async def run():
     if recent_conversation:
         memory_text += "\n\n" + recent_conversation
 
-    instruction = AGENT_INSTRUCTION + memory_text
+    instruction = (
+        AGENT_INSTRUCTION
+        + "\n\nLATENCY RULES: For movement/tool commands, act immediately. "
+          "Do not add explanations before calling the tool. Keep spoken "
+          "confirmation to one short sentence after the tool succeeds."
+        + memory_text
+    )
 
     setup = {
         "setup": {
@@ -1254,6 +1305,7 @@ async def run():
 
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
+                "temperature": 0.25,
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
