@@ -17,6 +17,8 @@ import shutil
 import time
 import socket
 import inspect
+import queue
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -100,7 +102,7 @@ LIVE_MODEL = os.getenv(
 )
 
 SERIAL_PORT_DISPLAY = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
-MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "30"))
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "20"))
 SESSION_ID = os.getenv("WALLE_SESSION_ID", "") or time.strftime(
     "%Y%m%d-%H%M%S"
 )
@@ -121,6 +123,87 @@ _image_analysis_completed = False
 _turn_started_at = None
 _first_ai_text_at = None
 _ai_audio_started_at = None
+
+# Low-latency audio playback:
+# Gemini receive loop only enqueues PCM. A dedicated worker owns ALSA writes.
+_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "48"))
+_audio_queue = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
+_audio_stop = threading.Event()
+_audio_worker = None
+_audio_stream = None
+_audio_playback_started = threading.Event()
+
+
+def _audio_worker_loop():
+    """Dedicated ALSA consumer. Never block the Gemini WebSocket reader."""
+    global _audio_stream
+
+    while not _audio_stop.is_set():
+        try:
+            item = _audio_queue.get(timeout=0.10)
+        except queue.Empty:
+            continue
+
+        if item is None:
+            break
+
+        try:
+            stream = _audio_stream
+            if stream is not None:
+                stream.write(item)
+        except Exception as e:
+            logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
+        finally:
+            _audio_queue.task_done()
+
+
+def start_audio_worker(stream):
+    global _audio_worker, _audio_stream
+    _audio_stream = stream
+    _audio_stop.clear()
+
+    if _audio_worker is None or not _audio_worker.is_alive():
+        _audio_worker = threading.Thread(
+            target=_audio_worker_loop,
+            name="WALLE-Audio-ALSA",
+            daemon=True,
+        )
+        _audio_worker.start()
+
+
+def clear_audio_queue():
+    """Drop stale AI audio so an old response can never delay a new command."""
+    dropped = 0
+    while True:
+        try:
+            _audio_queue.get_nowait()
+            _audio_queue.task_done()
+            dropped += 1
+        except queue.Empty:
+            break
+
+    if dropped:
+        logger.info("🔊 AUDIO QUEUE CLEAR | dropped=%d chunks", dropped)
+
+
+def stop_audio_worker():
+    global _audio_worker, _audio_stream
+    _audio_stop.set()
+
+    try:
+        _audio_queue.put_nowait(None)
+    except queue.Full:
+        clear_audio_queue()
+        try:
+            _audio_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    if _audio_worker is not None and _audio_worker.is_alive():
+        _audio_worker.join(timeout=1.0)
+
+    _audio_worker = None
+    _audio_stream = None
 
 
 def _stamp():
@@ -424,40 +507,55 @@ def resample24to48(b):
 # ---------------------------------------------------------------------------
 
 async def mic_loop(ws, mic):
+    """Continuously forward microphone PCM to Gemini with minimal scheduling delay."""
     loop = asyncio.get_running_loop()
+    tx_count = 0
 
     while True:
         try:
+            t_capture = time.monotonic()
+
             data, _ = await loop.run_in_executor(
                 None,
                 mic.read,
                 MIC_CHUNK,
             )
 
-            if data and not is_ai_speaking:
-                await ws.send(
-                    dumps(
+            if not data:
+                continue
+
+            # IMPORTANT: Do not gate microphone input on is_ai_speaking.
+            # Gating it caused user speech to be silently discarded while
+            # WALL-E was speaking and could create huge apparent delays.
+            payload = {
+                "realtimeInput": {
+                    "mediaChunks": [
                         {
-                            "realtimeInput": {
-                                "mediaChunks": [
-                                    {
-                                        "mimeType": "audio/pcm;rate=16000",
-                                        "data": base64.b64encode(
-                                            bytes(data)
-                                        ).decode(),
-                                    }
-                                ]
-                            }
+                            "mimeType": "audio/pcm;rate=16000",
+                            "data": base64.b64encode(bytes(data)).decode(),
                         }
-                    )
+                    ]
+                }
+            }
+
+            t_send = time.monotonic()
+            await ws.send(dumps(payload))
+            tx_count += 1
+
+            # Log only periodically to avoid flooding the Pi terminal.
+            if tx_count % 100 == 0:
+                logger.info(
+                    "🎙️ MIC PIPELINE | chunks=%d | capture→send=%.1f ms",
+                    tx_count,
+                    (time.monotonic() - t_capture) * 1000,
                 )
 
         except asyncio.CancelledError:
             return
 
         except Exception as e:
-            logger.warning("🎤 Mic loop stopped: %s", e)
-            return
+            logger.warning("🎤 MIC LOOP ERROR | %s", e)
+            await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +960,7 @@ async def receive_loop(ws, speaker_info):
 
             if sc.get("interrupted"):
                 logger.info("⛔ AI TURN INTERRUPTED")
+                clear_audio_queue()
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
 
@@ -895,11 +994,23 @@ async def receive_loop(ws, speaker_info):
                             audio = resample24to48(audio)
 
                         if speaker:
-                            await loop.run_in_executor(
-                                None,
-                                speaker.write,
-                                audio,
-                            )
+                            # Never write to ALSA from the Gemini WebSocket
+                            # receive coroutine. Queue it for the dedicated
+                            # playback worker.
+                            try:
+                                _audio_queue.put_nowait(audio)
+                            except queue.Full:
+                                # Stale audio is worse than dropping one chunk:
+                                # keep the robot responsive to the current turn.
+                                try:
+                                    _audio_queue.get_nowait()
+                                    _audio_queue.task_done()
+                                except queue.Empty:
+                                    pass
+                                try:
+                                    _audio_queue.put_nowait(audio)
+                                except queue.Full:
+                                    pass
 
             if sc.get("turnComplete"):
                 # Final turn summaries.
@@ -972,6 +1083,14 @@ async def receive_loop(ws, speaker_info):
                         "user first transcript → turn complete",
                         _latency_ms(_turn_started_at),
                     )
+
+                logger.info(
+                    "📊 TURN STATS | user=%d chars | ai=%d chars | "
+                    "audio_queue=%d | mic_continuous=True",
+                    len(user_text),
+                    len(ai_text),
+                    _audio_queue.qsize(),
+                )
 
                 _image_analysis_active = False
                 _image_analysis_completed = False
@@ -1259,6 +1378,7 @@ async def run():
     mic.start()
 
     speaker_info = open_speaker()
+    start_audio_worker(speaker_info[0])
 
     url = (
         "wss://generativelanguage.googleapis.com/ws/"
@@ -1333,6 +1453,8 @@ async def run():
             mic.close()
         except Exception:
             pass
+
+        stop_audio_worker()
 
         if speaker_info[0]:
             try:
