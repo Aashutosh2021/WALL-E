@@ -23,7 +23,7 @@ logger = logging.getLogger("WALLE")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/serial0"))
-BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "9600")))
+BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "115200")))
 ENABLE_ESP32_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {
     "1", "true", "yes", "on"
 }
@@ -306,7 +306,7 @@ async def _search_web(query: str) -> str:
         return f"Search error: {e}"
 
 
-async def _remember_fact(fact: str) -> str:
+def _remember_fact_sync(fact: str) -> str:
     path = os.path.join(BASE, "memory.json")
     memories = []
 
@@ -339,6 +339,16 @@ async def _remember_fact(fact: str) -> str:
 
     except Exception as e:
         return f"Failed to memorize: {e}"
+
+
+async def _remember_fact(fact: str) -> str:
+    # This function is a coroutine, and the tool dispatcher awaits
+    # coroutines directly (assuming they don't block). The file I/O below
+    # is synchronous disk access — on Pi's SD card this can stall for real
+    # time under contention, blocking the ENTIRE asyncio event loop
+    # (mic reads, audio playback, everything) for that duration. Push it
+    # to a worker thread instead.
+    return await asyncio.to_thread(_remember_fact_sync, fact)
 
 
 TOOL_MAP = {

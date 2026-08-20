@@ -44,7 +44,21 @@ from conversation_memory import (
     init_db,
     save_message,
     format_recent_context,
+    close as db_close,
 )
+
+
+async def _save_message_bg(*args, **kwargs):
+    """Fire-and-forget SQLite persistence. Called via asyncio.create_task
+    (never awaited directly) so a disk write can NEVER add latency to a
+    tool response or the turn-complete signal — those are what the user
+    (and Gemini's own turn-taking) actually waits on. Errors are logged
+    here since nothing else will ever observe this task's outcome."""
+    try:
+        await asyncio.to_thread(save_message, *args, **kwargs)
+    except Exception as e:
+        logger.warning("💾 MEMORY SAVE FAILED (background) | %s", e)
+
 
 
 # ---------------------------------------------------------------------------
@@ -980,9 +994,8 @@ async def handle_other_tool(call):
             result,
         )
 
-        try:
-            await asyncio.to_thread(
-                save_message,
+        asyncio.create_task(
+            _save_message_bg(
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -990,8 +1003,7 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        except Exception as e:
-            logger.warning("💾 MEMORY SAVE VISION FAILED | %s", e)
+        )
 
         return result
 
@@ -1017,9 +1029,8 @@ async def handle_other_tool(call):
             result,
         )
 
-        try:
-            await asyncio.to_thread(
-                save_message,
+        asyncio.create_task(
+            _save_message_bg(
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -1027,8 +1038,7 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        except Exception as e:
-            logger.warning("💾 MEMORY SAVE TOOL FAILED | %s", e)
+        )
 
         return result
 
@@ -1203,41 +1213,35 @@ async def receive_loop(ws, speaker_info):
                 if ai_text:
                     log_ai(ai_text)
 
-                # Persist the completed conversational turn.
-                # SQLite WAL keeps this fast and crash-safe enough for Pi use.
+                # Persist the completed conversational turn — fire-and-forget.
+                # These used to be awaited HERE, sequentially, meaning the
+                # "turn complete" latency number included two full SQLite
+                # open+write round trips that have zero bearing on what the
+                # user actually experienced (they'd already heard the reply).
                 if user_text:
-                    try:
-                        await asyncio.to_thread(
-                            save_message,
-                            "user",
-                            user_text,
-                            SESSION_ID,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "💾 MEMORY SAVE USER FAILED | %s",
-                            e,
-                        )
+                    asyncio.create_task(
+                        _save_message_bg("user", user_text, SESSION_ID)
+                    )
 
                 if ai_text:
-                    try:
-                        await asyncio.to_thread(
-                            save_message,
-                            "assistant",
-                            ai_text,
-                            SESSION_ID,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "💾 MEMORY SAVE AI FAILED | %s",
-                            e,
-                        )
+                    asyncio.create_task(
+                        _save_message_bg("assistant", ai_text, SESSION_ID)
+                    )
 
                 _user_transcript_parts.clear()
                 _ai_transcript_parts.clear()
 
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
+
+                # Measure latency HERE — right after the state the user
+                # actually perceives is settled, BEFORE the IMG_CLEAR
+                # bookkeeping below (which the user never waits on).
+                if _turn_started_at is not None:
+                    _log_latency(
+                        "user first transcript → turn complete",
+                        _latency_ms(_turn_started_at),
+                    )
 
                 # Clear the ESP32 image ONLY after a successful image-analysis turn.
                 if _image_analysis_active and _image_analysis_completed:
@@ -1252,12 +1256,6 @@ async def receive_loop(ws, speaker_info):
                     logger.warning(
                         "⚠️ IMAGE TURN ENDED WITHOUT SUCCESSFUL ANALYSIS | "
                         "IMG_CLEAR NOT SENT"
-                    )
-
-                if _turn_started_at is not None:
-                    _log_latency(
-                        "user first transcript → turn complete",
-                        _latency_ms(_turn_started_at),
                     )
 
                 logger.info(
@@ -1341,9 +1339,17 @@ async def receive_loop(ws, speaker_info):
             else:
                 result = f"Invalid direction '{d}'."
 
-            try:
-                await asyncio.to_thread(
-                    save_message,
+            # send_tool_response FIRST — this is what Gemini is waiting on
+            # to continue the conversation. The DB write has zero bearing
+            # on that and must never sit in front of it.
+            await send_tool_response(
+                ws,
+                cid,
+                result,
+            )
+
+            asyncio.create_task(
+                _save_message_bg(
                     "tool",
                     str(result),
                     SESSION_ID,
@@ -1351,13 +1357,6 @@ async def receive_loop(ws, speaker_info):
                     json.dumps(args, ensure_ascii=False),
                     str(result),
                 )
-            except Exception as e:
-                logger.warning("💾 MEMORY SAVE MOVE FAILED | %s", e)
-
-            await send_tool_response(
-                ws,
-                cid,
-                result,
             )
 
         # Other tools are handled after movement.
@@ -1649,6 +1648,7 @@ async def run():
 
         eye("STOP")
         close_uart()
+        db_close()
 
         if vision_session and not vision_session.closed:
             await vision_session.close()
