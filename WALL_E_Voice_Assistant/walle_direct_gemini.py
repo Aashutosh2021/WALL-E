@@ -5,6 +5,7 @@
 - ESP32 uses persistent USB serial (/dev/ttyUSB0 by default).
 - Camera stays warm with picamera2.
 - Live API input/output transcription is enabled for detailed terminal logs.
+- VAD (Voice Activity Detection) enabled for instant speech detection & printing.
 """
 
 import os
@@ -17,6 +18,7 @@ import shutil
 import time
 import socket
 import inspect
+import collections
 
 import numpy as np
 import sounddevice as sd
@@ -77,7 +79,8 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 # Persistent conversation DB (SQLite/WAL; no extra package required).
 init_db()
 
-MIC_CHUNK = int(os.getenv("MIC_CHUNK", "512"))
+# Reduced MIC_CHUNK for lower latency (256 samples = 16ms at 16kHz)
+MIC_CHUNK = int(os.getenv("MIC_CHUNK", "256"))
 VISION_ENABLED = os.getenv("ENABLE_VISION", "1").lower() in {
     "1", "true", "yes", "on"
 }
@@ -121,6 +124,13 @@ _image_analysis_completed = False
 _turn_started_at = None
 _first_ai_text_at = None
 _ai_audio_started_at = None
+
+# VAD state for instant speech detection
+_vad_audio_buffer = collections.deque(maxlen=8)  # ~128ms buffer at 256 samples
+_vad_speech_started = False
+_vad_speech_printed = False
+_last_user_text_logged = ""
+_vad_speech_started_at = None  # Track when speech was first detected
 
 
 def _stamp():
@@ -420,12 +430,27 @@ def resample24to48(b):
 
 
 # ---------------------------------------------------------------------------
-# Microphone
+# Microphone with VAD for instant speech detection
 # ---------------------------------------------------------------------------
 
-async def mic_loop(ws, mic):
-    loop = asyncio.get_running_loop()
+def _compute_energy(audio_bytes):
+    """Compute RMS energy of audio chunk for simple VAD."""
+    samples = np.frombuffer(audio_bytes, dtype=np.int16)
+    if len(samples) == 0:
+        return 0
+    return np.sqrt(np.mean(samples.astype(np.float32) ** 2))
 
+
+async def mic_loop(ws, mic):
+    global _vad_speech_started, _vad_speech_printed, _last_user_text_logged, _vad_speech_started_at
+    loop = asyncio.get_running_loop()
+    
+    # VAD thresholds
+    ENERGY_THRESHOLD = 150  # Adjust based on mic sensitivity
+    SILENCE_CHUNKS = 3  # chunks of silence before resetting
+    
+    silence_count = 0
+    
     while True:
         try:
             data, _ = await loop.run_in_executor(
@@ -435,6 +460,33 @@ async def mic_loop(ws, mic):
             )
 
             if data and not is_ai_speaking:
+                # Compute energy for VAD
+                energy = _compute_energy(bytes(data))
+                
+                # Update VAD buffer
+                _vad_audio_buffer.append(energy)
+                
+                # Simple VAD: check if recent average energy exceeds threshold
+                if len(_vad_audio_buffer) >= 3:
+                    avg_energy = sum(_vad_audio_buffer) / len(_vad_audio_buffer)
+                    
+                    if avg_energy > ENERGY_THRESHOLD:
+                        # Speech detected
+                        if not _vad_speech_started:
+                            _vad_speech_started = True
+                            _vad_speech_printed = False
+                            _vad_speech_started_at = time.monotonic()
+                            logger.info("🎤 SPEECH DETECTED [%s]", _stamp())
+                        silence_count = 0
+                    else:
+                        # Silence detected
+                        silence_count += 1
+                        if silence_count >= SILENCE_CHUNKS:
+                            _vad_speech_started = False
+                            _vad_speech_printed = False
+                            _vad_speech_started_at = None
+                
+                # Send audio to Gemini
                 await ws.send(
                     dumps(
                         {
@@ -801,7 +853,7 @@ async def receive_loop(ws, speaker_info):
 
         if sc:
             # ---------------------------------------------------------------
-            # USER TRANSCRIPTION
+            # USER TRANSCRIPTION - INSTANT PRINT ON FIRST CHUNK
             # ---------------------------------------------------------------
             inp = sc.get("inputTranscription")
             if inp:
@@ -816,16 +868,26 @@ async def receive_loop(ws, speaker_info):
                         _image_analysis_active = False
                         _image_analysis_completed = False
                         logger.info("🎤 USER TURN START [%s]", _stamp())
+                        
+                        # IMMEDIATE latency logging for first user transcript
+                        if _vad_speech_started_at is not None:
+                            logger.info(
+                                "⚡ LATENCY | speech detected → first transcript | %.0f ms (%.2f s)",
+                                _latency_ms(_vad_speech_started_at, now),
+                                _latency_ms(_vad_speech_started_at, now) / 1000.0
+                            )
 
                     _user_transcript_parts.append(text)
+                    
+                    # INSTANT print of user speech (every chunk, not just final)
                     logger.info(
-                        "👤 USER TRANSCRIPT [%s] | %s",
+                        "👤 USER [%s] | %s",
                         _stamp(),
                         text,
                     )
 
             # ---------------------------------------------------------------
-            # AI OUTPUT TRANSCRIPTION
+            # AI OUTPUT TRANSCRIPTION - INSTANT PRINT
             # ---------------------------------------------------------------
             out = sc.get("outputTranscription")
             if out:
@@ -850,9 +912,10 @@ async def receive_loop(ws, speaker_info):
 
                     _ai_transcript_parts.append(text)
 
+                    # INSTANT print of AI response (every chunk)
                     logger.info(
 
-                        "🤖 AI TRANSCRIPT [%s] | %s",
+                        "🤖 AI [%s] | %s",
 
                         _stamp(),
 

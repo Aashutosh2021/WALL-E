@@ -1,23 +1,6 @@
-# Python cache & compiled files
-__pycache__/
-*.py[cod]
-
-# Virtual environment
-.venv/
-venv/
-ENV/
-env/
-
-# Environment variables & Credentials
+```
+# Environment variables
 .env
-*.env
-
-
-# Memory & database files
-walle_memory/
-*.db
-
-#Documents
-Repository File Structure & Cleanup Guide.md
-Motortest
-extra
+.env.local
+.env.*
+```
