@@ -140,7 +140,7 @@ _ai_audio_started_at = None
 
 # Low-latency audio playback:
 # Gemini receive loop only enqueues PCM. A dedicated worker owns ALSA writes.
-_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "48"))
+_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "250"))
 _audio_queue = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
 _audio_stop = threading.Event()
 _audio_worker = None
@@ -1127,6 +1127,20 @@ async def receive_loop(ws, speaker_info):
 
                         )
 
+                        # Print the user's COMPLETE sentence right here —
+                        # the moment AI starts responding, not after the AI
+                        # finishes its entire spoken reply. Gemini starting
+                        # its output IS the signal that the user's turn is
+                        # done; waiting for turnComplete to show this made a
+                        # 1-2s recognition look like an 8s delay.
+                        user_so_far = "".join(_user_transcript_parts).strip()
+                        if user_so_far:
+                            logger.info(
+                                "👤 USER FINAL [%s] | %s",
+                                _stamp(),
+                                user_so_far,
+                            )
+
                     _ai_transcript_parts.append(text)
 
                     logger.info(
@@ -1204,8 +1218,8 @@ async def receive_loop(ws, speaker_info):
                 ai_text = "".join(_ai_transcript_parts).strip()
 
                 if user_text:
-                    logger.info(
-                        "👤 USER FINAL [%s] | %s",
+                    logger.debug(
+                        "👤 USER FINAL (turn-complete, already shown) [%s] | %s",
                         _stamp(),
                         user_text,
                     )
