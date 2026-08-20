@@ -11,7 +11,6 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.getenv(
@@ -25,20 +24,21 @@ _initialized = False
 
 
 def _connect():
-    """Reuses one connection per thread instead of opening fresh + re-running
-    all PRAGMAs on every single call. save_message() is called several
-    times per conversational turn (user, assistant, tool results) — on a
-    Pi's SD card, repeated open/close is real, avoidable overhead."""
+    """Return this thread's persistent connection, opening it once.
+
+    BUG FIXED: `_local = threading.local()` was already declared at module
+    scope but never referenced anywhere — every save_message()/
+    get_recent_messages() call was opening a brand-new sqlite3 connection
+    (connect + 3 PRAGMA statements) and closing it again immediately after.
+    That runs on the asyncio.to_thread() hot path after every single
+    user/assistant/tool turn, including every move_robot call. Reusing one
+    connection per worker thread removes that connect/PRAGMA/close
+    overhead from the common case. Schema, WAL mode, and all call
+    signatures are unchanged.
+    """
     conn = getattr(_local, "conn", None)
     if conn is not None:
-        try:
-            conn.execute("SELECT 1")
-            return conn
-        except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        return conn
 
     conn = sqlite3.connect(
         DB_PATH,
@@ -64,30 +64,33 @@ def init_db():
         os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 
         conn = _connect()
-        try:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS conversation (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts REAL NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    session_id TEXT,
-                    tool_name TEXT,
-                    tool_args TEXT,
-                    tool_result TEXT
-                );
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS conversation (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                session_id TEXT,
+                tool_name TEXT,
+                tool_args TEXT,
+                tool_result TEXT
+            );
 
-                CREATE INDEX IF NOT EXISTS idx_conversation_ts
-                    ON conversation(ts);
+            CREATE INDEX IF NOT EXISTS idx_conversation_ts
+                ON conversation(ts);
 
-                CREATE INDEX IF NOT EXISTS idx_conversation_session_ts
-                    ON conversation(session_id, ts);
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
+            CREATE INDEX IF NOT EXISTS idx_conversation_session_ts
+                ON conversation(session_id, ts);
+            """
+        )
+        conn.commit()
+        # NOTE: connection is intentionally left open — it's the calling
+        # thread's persistent handle now (see _connect()), not a
+        # short-lived one. init_db() usually runs on the main thread at
+        # startup; closing it here would poison that thread's cached
+        # connection for every later call on the same thread (e.g.
+        # format_recent_context() in run()).
 
         _initialized = True
 
@@ -173,6 +176,12 @@ def format_recent_context(limit=30, session_id=None):
 
 
 def close():
+    """Close this thread's persistent connection, if one is open.
+
+    Connections are now thread-local and long-lived (see _connect()), so
+    unlike the old short-lived-per-call design there IS something to close
+    here — mainly useful for clean shutdown/tests on the calling thread.
+    """
     conn = getattr(_local, "conn", None)
     if conn is not None:
         try:

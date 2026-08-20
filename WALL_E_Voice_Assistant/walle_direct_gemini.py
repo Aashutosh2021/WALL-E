@@ -46,21 +46,7 @@ from conversation_memory import (
     init_db,
     save_message,
     format_recent_context,
-    close as db_close,
 )
-
-
-async def _save_message_bg(*args, **kwargs):
-    """Fire-and-forget SQLite persistence. Called via asyncio.create_task
-    (never awaited directly) so a disk write can NEVER add latency to a
-    tool response or the turn-complete signal — those are what the user
-    (and Gemini's own turn-taking) actually waits on. Errors are logged
-    here since nothing else will ever observe this task's outcome."""
-    try:
-        await asyncio.to_thread(save_message, *args, **kwargs)
-    except Exception as e:
-        logger.warning("💾 MEMORY SAVE FAILED (background) | %s", e)
-
 
 
 # ---------------------------------------------------------------------------
@@ -140,16 +126,9 @@ _image_analysis_completed = False
 _turn_started_at = None
 _first_ai_text_at = None
 _ai_audio_started_at = None
-
-# VAD state for instant speech detection
-_vad_audio_buffer = collections.deque(maxlen=8)  # ~128ms buffer at 256 samples
-_vad_speech_started = False
-_vad_speech_printed = False
-_last_user_text_logged = ""
-_vad_speech_started_at = None  # Track when speech was first detected
 # Low-latency audio playback:
 # Gemini receive loop only enqueues PCM. A dedicated worker owns ALSA writes.
-_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "250"))
+_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "48"))
 _audio_queue = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
 _audio_stop = threading.Event()
 _audio_worker = None
@@ -176,10 +155,23 @@ _audio_stats = {
     "underruns": 0,
     "queue_peak": 0,
     "queue_waits": 0,
+    "queue_wait_ms_sum": 0.0,
+    "queue_wait_count": 0,
     "rx_chunks": 0,
     "rx_bytes": 0,
     "dropped": 0,
     "last_report": 0.0,
+}
+
+# Mic-side diagnostics. Separate lock: mic_loop runs on the asyncio thread,
+# audio worker/report code runs on a different thread — never share a lock
+# with the ALSA write path or a slow mic capture cannot stall audio stats.
+_mic_stats_lock = threading.Lock()
+_mic_stats = {
+    "chunks": 0,
+    "capture_ms_sum": 0.0,
+    "send_ms_sum": 0.0,
+    "bytes": 0,
 }
 
 
@@ -190,44 +182,92 @@ def _reset_audio_stats():
                 _audio_stats[k] = time.monotonic()
             else:
                 _audio_stats[k] = 0 if isinstance(_audio_stats[k], int) else 0.0
+    with _mic_stats_lock:
+        for k in _mic_stats:
+            _mic_stats[k] = 0 if isinstance(_mic_stats[k], int) else 0.0
 
 
 def _report_audio_stats(force=False):
-    """Log aggregate audio stats every ~2 seconds during playback."""
+    """Log aggregate audio + mic pipeline stats every ~2 seconds.
+
+    Runs on a fixed cadence regardless of turn boundaries so the numbers
+    reflect sustained pipeline health, not just one turn's snapshot.
+    """
     with _audio_stats_lock:
         now = time.monotonic()
-        if not force and (now - _audio_stats["last_report"]) < 2.0:
+        elapsed = now - (_audio_stats["last_report"] or now)
+        if not force and elapsed < 2.0:
             return
         if _audio_stats["writes"] == 0 and not force:
             return
         s = dict(_audio_stats)
         _audio_stats["last_report"] = now
 
-    avg_write = (s["write_time_ms"] / s["writes"]) if s["writes"] else 0
+    with _mic_stats_lock:
+        m = dict(_mic_stats)
+
+    elapsed = max(elapsed, 0.001)
+    alsa_write_ms = (s["write_time_ms"] / s["writes"]) if s["writes"] else 0.0
+    queue_wait_ms = (
+        s["queue_wait_ms_sum"] / s["queue_wait_count"]
+        if s["queue_wait_count"] else 0.0
+    )
+    mic_capture_ms = (m["capture_ms_sum"] / m["chunks"]) if m["chunks"] else 0.0
+    mic_send_ms = (m["send_ms_sum"] / m["chunks"]) if m["chunks"] else 0.0
+    audio_rx_rate = s["rx_bytes"] / elapsed
+    audio_play_rate = s["write_bytes"] / elapsed
+    queue_depth = _audio_queue.qsize()
+
     logger.info(
-        "📊 AUDIO STATS | writes=%d | bytes=%d | avg_write=%.1fms | "
-        "max_write=%.1fms | underruns=%d | q_peak=%d | q_waits=%d | "
-        "rx_chunks=%d | rx_bytes=%d | dropped=%d",
-        s["writes"], s["write_bytes"], avg_write, s["max_write_ms"],
-        s["underruns"], s["queue_peak"], s["queue_waits"],
-        s["rx_chunks"], s["rx_bytes"], s["dropped"],
+        "📊 AUDIO STATS | queue_depth=%d | queue_wait_ms=%.1f | "
+        "alsa_write_ms=%.1f | max_write_ms=%.1f | mic_capture_ms=%.1f | "
+        "mic_send_ms=%.1f | audio_rx_rate=%.0fB/s | audio_play_rate=%.0fB/s | "
+        "underruns=%d | dropped_chunks=%d | writes=%d | mic_chunks=%d",
+        queue_depth, queue_wait_ms,
+        alsa_write_ms, s["max_write_ms"], mic_capture_ms,
+        mic_send_ms, audio_rx_rate, audio_play_rate,
+        s["underruns"], s["dropped"], s["writes"], m["chunks"],
     )
 
 
 def _audio_worker_loop():
     """Dedicated ALSA consumer — writes consistent ~40ms PCM blocks.
 
-    Key design decisions that prevent ALSA underruns on Pi 3B+:
-    1. Prebuffer 80ms before the first write so ALSA's ring buffer has data.
+    Key design decisions that prevent audio underruns/stutter:
+    1. Prebuffer 80ms before the first write so the ring buffer has data.
     2. Write in fixed ~960-sample (40ms) blocks — never micro-writes.
-    3. Poll the queue every 5ms (not 50ms) so ALSA never starves.
+    3. Poll the queue at 5ms while a turn is actively draining, 50ms while
+       genuinely idle between turns, to cut background thread wakeups
+       during the ~95% of session time nothing is playing (see below).
     4. When the queue goes empty during playback, flush whatever remains
        in 'pending' so there is no trailing silence gap.
+
+    REGRESSION FIXED: 'started' used to be reset to False by the same
+    300ms-idle check that only exists to relax the *poll cadence*. That
+    coupling was wrong — native audio TTS routinely has 300ms+ silent
+    gaps BETWEEN PHRASES INSIDE ONE TURN (a natural speaking pause is not
+    the same thing as "turn is over"). Every time that happened mid-turn,
+    'started' flipped False, which re-armed the 80ms PREBUFFER GATE for
+    the very next chunk of the SAME response — audibly cutting the
+    speaker off for ~80ms in the middle of a sentence, repeatedly,
+    exactly matching "आवाज़ cut-cut के आ रहा है". Poll cadence and the
+    prebuffer gate are now tracked with two separate variables:
+    'started' is driven only by real write outcomes (set True on first
+    successful write, False only if a write actually fails), and
+    '_recently_active' is a pure cadence hint with no effect on
+    buffering. A short-lived poll-cadence miss costs at most one extra
+    ~45ms wait picking up the next chunk — inaudible. A false prebuffer
+    re-arm was a real, audible gap. These must never share a flag again.
     """
     global _audio_stream
 
+    IDLE_TIMEOUT = 0.05     # 50ms poll while nothing has played recently
+    ACTIVE_TIMEOUT = 0.005  # 5ms poll while a turn is draining
+    CADENCE_IDLE_AFTER_S = 1.5  # relax poll cadence only — never buffering
+
     pending = bytearray()
     started = False
+    last_activity = time.monotonic()
 
     def _write_block(data_bytes):
         """Write one block to the ALSA device and track stats."""
@@ -252,7 +292,10 @@ def _audio_worker_loop():
             if "underrun" in err_str.lower() or "Underrun" in err_str:
                 with _audio_stats_lock:
                     _audio_stats["underruns"] += 1
-                # Underrun recovery: ALSA auto-recovers, just keep writing.
+                # Underrun recovery: ALSA/PortAudio auto-recovers, just
+                # keep writing — this does NOT reset 'started'. A dropout
+                # mid-stream should not re-arm the prebuffer gate either;
+                # that would compound one glitch into a second, longer one.
                 return True
             logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
             return False
@@ -268,8 +311,13 @@ def _audio_worker_loop():
         return True
 
     while not _audio_stop.is_set():
+        # Cadence-only: how fast we poll. Never touches 'started' or the
+        # prebuffer gate — see docstring.
+        recently_active = (time.monotonic() - last_activity) < CADENCE_IDLE_AFTER_S
+        poll_timeout = ACTIVE_TIMEOUT if (started or recently_active) else IDLE_TIMEOUT
+
         try:
-            item = _audio_queue.get(timeout=0.005)  # 5ms — keeps ALSA fed
+            item = _audio_queue.get(timeout=poll_timeout)
         except queue.Empty:
             with _audio_stats_lock:
                 _audio_stats["queue_waits"] += 1
@@ -292,7 +340,15 @@ def _audio_worker_loop():
             break
 
         try:
-            pending.extend(item)
+            enqueue_ts, data = item
+            now = time.monotonic()
+            last_activity = now
+
+            with _audio_stats_lock:
+                _audio_stats["queue_wait_ms_sum"] += (now - enqueue_ts) * 1000
+                _audio_stats["queue_wait_count"] += 1
+
+            pending.extend(data)
 
             # Track queue depth
             qsize = _audio_queue.qsize()
@@ -696,28 +752,27 @@ def resample24to48(b):
 
 
 # ---------------------------------------------------------------------------
-# Microphone with VAD for instant speech detection
+# Microphone
 # ---------------------------------------------------------------------------
-
-def _compute_energy(audio_bytes):
-    """Compute RMS energy of audio chunk for simple VAD."""
-    samples = np.frombuffer(audio_bytes, dtype=np.int16)
-    if len(samples) == 0:
-        return 0
-    return np.sqrt(np.mean(samples.astype(np.float32) ** 2))
 
 
 async def mic_loop(ws, mic):
-    global _vad_speech_started, _vad_speech_printed, _last_user_text_logged, _vad_speech_started_at
-    loop = asyncio.get_running_loop()
-    
-    # VAD thresholds
-    ENERGY_THRESHOLD = 150  # Adjust based on mic sensitivity
-    SILENCE_CHUNKS = 3  # chunks of silence before resetting
-    
-    silence_count = 0
-    
-    """Continuously forward microphone PCM to Gemini with minimal scheduling delay."""
+    """Continuously forward microphone PCM to Gemini with minimal scheduling delay.
+
+    Per-chunk timing is split into two numbers instead of one combined
+    "capture->send" figure, because they point at different bottlenecks:
+
+    - mic_capture_ms: time the executor thread spent inside the blocking
+      mic.read() call beyond the nominal MIC_CHUNK/16000 duration (~32ms).
+      A rising value here means the *scheduler* isn't getting back to this
+      thread promptly — i.e. something else (GIL churn, CPU pressure) is
+      delaying it, not the audio hardware itself.
+    - mic_send_ms: time spent awaiting ws.send(). A rising value here
+      points at the network/WebSocket, not local scheduling.
+
+    Both are accumulated into _mic_stats every chunk (cheap float adds)
+    so 📊 AUDIO STATS reflects the true average, not a 1-in-100 sample.
+    """
     loop = asyncio.get_running_loop()
     tx_count = 0
 
@@ -731,36 +786,8 @@ async def mic_loop(ws, mic):
                 MIC_CHUNK,
             )
 
-            if data and not is_ai_speaking:
-                # Compute energy for VAD
-                energy = _compute_energy(bytes(data))
-                
-                # Update VAD buffer
-                _vad_audio_buffer.append(energy)
-                
-                # Simple VAD: check if recent average energy exceeds threshold
-                if len(_vad_audio_buffer) >= 3:
-                    avg_energy = sum(_vad_audio_buffer) / len(_vad_audio_buffer)
-                    
-                    if avg_energy > ENERGY_THRESHOLD:
-                        # Speech detected
-                        if not _vad_speech_started:
-                            _vad_speech_started = True
-                            _vad_speech_printed = False
-                            _vad_speech_started_at = time.monotonic()
-                            logger.info("🎤 SPEECH DETECTED [%s]", _stamp())
-                        silence_count = 0
-                    else:
-                        # Silence detected
-                        silence_count += 1
-                        if silence_count >= SILENCE_CHUNKS:
-                            _vad_speech_started = False
-                            _vad_speech_printed = False
-                            _vad_speech_started_at = None
-                
-                # Send audio to Gemini
-                await ws.send(
-                    dumps(
+            t_captured = time.monotonic()
+
             if not data:
                 continue
 
@@ -778,19 +805,51 @@ async def mic_loop(ws, mic):
                 }
             }
 
-            t_send = time.monotonic()
             await ws.send(dumps(payload))
+            t_sent = time.monotonic()
             tx_count += 1
 
-            # Log only periodically to avoid flooding the Pi terminal.
+            capture_ms = (t_captured - t_capture) * 1000
+            send_ms = (t_sent - t_captured) * 1000
+
+            with _mic_stats_lock:
+                _mic_stats["chunks"] += 1
+                _mic_stats["capture_ms_sum"] += capture_ms
+                _mic_stats["send_ms_sum"] += send_ms
+                _mic_stats["bytes"] += len(data)
+
+            # Full-detail log only periodically to avoid flooding the Pi
+            # terminal — the per-chunk numbers still feed the 2s aggregate
+            # above regardless of whether this line prints.
             if tx_count % 100 == 0:
                 logger.info(
-                    "🎙️ MIC PIPELINE | chunks=%d | capture→send=%.1f ms",
+                    "🎙️ MIC CAPTURE | chunks=%d | capture_ms=%.1f | "
+                    "📡 GEMINI AUDIO TX | send_ms=%.1f",
                     tx_count,
-                    (time.monotonic() - t_capture) * 1000,
+                    capture_ms,
+                    send_ms,
                 )
 
         except asyncio.CancelledError:
+            return
+
+        except websockets.exceptions.ConnectionClosed:
+            # BUG FIXED: this used to fall into the generic `except
+            # Exception` branch below, log a warning, sleep 50ms, and loop
+            # right back into `ws.send()` on the SAME dead socket — forever.
+            # mic.read() always succeeds (it's local hardware), so this
+            # produced an infinite 50ms-interval error-log loop that never
+            # raised, which meant asyncio.wait(..., FIRST_EXCEPTION) in
+            # run() never woke up: receive_loop's `async for raw in ws`
+            # exits silently on a closed socket (no exception), and with
+            # mic_task neither finishing nor raising, run() blocked forever
+            # with zero output until the process was killed by hand. This
+            # is the exact "spoke, waited ~1 minute, nothing happened"
+            # failure: the Live API closed the socket normally (code 1000,
+            # e.g. a session-duration limit) and the app never noticed.
+            # Returning here lets run()'s reconnect loop actually see the
+            # task finish and reconnect.
+            logger.info("🎤 MIC LOOP | WebSocket closed, exiting mic_loop")
             return
 
         except Exception as e:
@@ -1050,8 +1109,9 @@ async def handle_other_tool(call):
             result,
         )
 
-        asyncio.create_task(
-            _save_message_bg(
+        try:
+            await asyncio.to_thread(
+                save_message,
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -1059,7 +1119,8 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        )
+        except Exception as e:
+            logger.warning("💾 MEMORY SAVE VISION FAILED | %s", e)
 
         return result
 
@@ -1085,8 +1146,9 @@ async def handle_other_tool(call):
             result,
         )
 
-        asyncio.create_task(
-            _save_message_bg(
+        try:
+            await asyncio.to_thread(
+                save_message,
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -1094,7 +1156,8 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        )
+        except Exception as e:
+            logger.warning("💾 MEMORY SAVE TOOL FAILED | %s", e)
 
         return result
 
@@ -1193,20 +1256,6 @@ async def receive_loop(ws, speaker_info):
 
                         )
 
-                        # Print the user's COMPLETE sentence right here —
-                        # the moment AI starts responding, not after the AI
-                        # finishes its entire spoken reply. Gemini starting
-                        # its output IS the signal that the user's turn is
-                        # done; waiting for turnComplete to show this made a
-                        # 1-2s recognition look like an 8s delay.
-                        user_so_far = "".join(_user_transcript_parts).strip()
-                        if user_so_far:
-                            logger.info(
-                                "👤 USER FINAL [%s] | %s",
-                                _stamp(),
-                                user_so_far,
-                            )
-
                     _ai_transcript_parts.append(text)
 
                     # INSTANT print of AI response (every chunk)
@@ -1258,12 +1307,16 @@ async def receive_loop(ws, speaker_info):
                         if speaker:
                             # Never write to ALSA from the Gemini WebSocket
                             # receive coroutine. Queue it for the dedicated
-                            # playback worker.
+                            # playback worker. Items carry an enqueue
+                            # timestamp so the worker can report real
+                            # queue_wait_ms (time actually spent waiting,
+                            # not just a wait-event counter).
                             with _audio_stats_lock:
                                 _audio_stats["rx_chunks"] += 1
                                 _audio_stats["rx_bytes"] += len(audio)
+                            item = (time.monotonic(), audio)
                             try:
-                                _audio_queue.put_nowait(audio)
+                                _audio_queue.put_nowait(item)
                             except queue.Full:
                                 # Stale audio is worse than dropping one chunk:
                                 # keep the robot responsive to the current turn.
@@ -1275,7 +1328,7 @@ async def receive_loop(ws, speaker_info):
                                 except queue.Empty:
                                     pass
                                 try:
-                                    _audio_queue.put_nowait(audio)
+                                    _audio_queue.put_nowait(item)
                                 except queue.Full:
                                     pass
 
@@ -1285,8 +1338,8 @@ async def receive_loop(ws, speaker_info):
                 ai_text = "".join(_ai_transcript_parts).strip()
 
                 if user_text:
-                    logger.debug(
-                        "👤 USER FINAL (turn-complete, already shown) [%s] | %s",
+                    logger.info(
+                        "👤 USER FINAL [%s] | %s",
                         _stamp(),
                         user_text,
                     )
@@ -1294,35 +1347,41 @@ async def receive_loop(ws, speaker_info):
                 if ai_text:
                     log_ai(ai_text)
 
-                # Persist the completed conversational turn — fire-and-forget.
-                # These used to be awaited HERE, sequentially, meaning the
-                # "turn complete" latency number included two full SQLite
-                # open+write round trips that have zero bearing on what the
-                # user actually experienced (they'd already heard the reply).
+                # Persist the completed conversational turn.
+                # SQLite WAL keeps this fast and crash-safe enough for Pi use.
                 if user_text:
-                    asyncio.create_task(
-                        _save_message_bg("user", user_text, SESSION_ID)
-                    )
+                    try:
+                        await asyncio.to_thread(
+                            save_message,
+                            "user",
+                            user_text,
+                            SESSION_ID,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "💾 MEMORY SAVE USER FAILED | %s",
+                            e,
+                        )
 
                 if ai_text:
-                    asyncio.create_task(
-                        _save_message_bg("assistant", ai_text, SESSION_ID)
-                    )
+                    try:
+                        await asyncio.to_thread(
+                            save_message,
+                            "assistant",
+                            ai_text,
+                            SESSION_ID,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "💾 MEMORY SAVE AI FAILED | %s",
+                            e,
+                        )
 
                 _user_transcript_parts.clear()
                 _ai_transcript_parts.clear()
 
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
-
-                # Measure latency HERE — right after the state the user
-                # actually perceives is settled, BEFORE the IMG_CLEAR
-                # bookkeeping below (which the user never waits on).
-                if _turn_started_at is not None:
-                    _log_latency(
-                        "user first transcript → turn complete",
-                        _latency_ms(_turn_started_at),
-                    )
 
                 # Clear the ESP32 image ONLY after a successful image-analysis turn.
                 if _image_analysis_active and _image_analysis_completed:
@@ -1337,6 +1396,12 @@ async def receive_loop(ws, speaker_info):
                     logger.warning(
                         "⚠️ IMAGE TURN ENDED WITHOUT SUCCESSFUL ANALYSIS | "
                         "IMG_CLEAR NOT SENT"
+                    )
+
+                if _turn_started_at is not None:
+                    _log_latency(
+                        "user first transcript → turn complete",
+                        _latency_ms(_turn_started_at),
                     )
 
                 logger.info(
@@ -1420,17 +1485,9 @@ async def receive_loop(ws, speaker_info):
             else:
                 result = f"Invalid direction '{d}'."
 
-            # send_tool_response FIRST — this is what Gemini is waiting on
-            # to continue the conversation. The DB write has zero bearing
-            # on that and must never sit in front of it.
-            await send_tool_response(
-                ws,
-                cid,
-                result,
-            )
-
-            asyncio.create_task(
-                _save_message_bg(
+            try:
+                await asyncio.to_thread(
+                    save_message,
                     "tool",
                     str(result),
                     SESSION_ID,
@@ -1438,6 +1495,13 @@ async def receive_loop(ws, speaker_info):
                     json.dumps(args, ensure_ascii=False),
                     str(result),
                 )
+            except Exception as e:
+                logger.warning("💾 MEMORY SAVE MOVE FAILED | %s", e)
+
+            await send_tool_response(
+                ws,
+                cid,
+                result,
             )
 
         # Other tools are handled after movement.
@@ -1514,6 +1578,40 @@ async def run():
             # Live API transcription settings are setup-level fields.
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
+
+            # BUG FIXED: "gets slower the longer we talk" — this was not a
+            # scheduling/thread bug like the earlier ones. Verified against
+            # Google's own Live API docs: the context window is cumulative
+            # — every turn re-processes ALL prior tokens, and native-audio
+            # sessions accumulate ~25 tokens PER SECOND of audio. This
+            # code streams the mic continuously all session long (by
+            # design — gating it on is_ai_speaking was already tried and
+            # reverted, see mic_loop's docstring), so the context grows
+            # every second the app runs, not just on turns. Each new turn
+            # pays to re-process a strictly larger history than the last,
+            # which is a real, monotonic, per-turn latency increase — and
+            # eventually the 15-minute/128k-token session cap kills the
+            # connection outright (the "sent 1000 (OK)" disconnect fixed
+            # last round). contextWindowCompression makes the server
+            # evict old tokens past a threshold instead of re-billing
+            # (and re-processing) the whole history forever.
+            #
+            # RETUNED: Google's own doc example (trigger 25k / target 8k)
+            # is sized for letting a session run long before paying
+            # compression's "forgets old turns" cost. It does NOT help a
+            # short conversation — at ~25 tokens/sec of continuous audio
+            # (this app streams mic the whole session, not just while
+            # talking), 25k tokens is roughly 15+ minutes away, so a
+            # normal few-minute test never reaches it and every turn
+            # keeps getting slower exactly as before. Given the stated
+            # priority is "any how fast, 2-4 sec, every reply" over deep
+            # same-session memory, trigger low enough that compression
+            # engages within the first turn or two and keeps the working
+            # context small continuously, instead of once after 15 min.
+            "contextWindowCompression": {
+                "triggerTokens": 6000,
+                "slidingWindow": {"targetTokens": 2000},
+            },
 
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
@@ -1641,6 +1739,23 @@ async def run():
     )
     mic.start()
 
+    # Diagnostic: mirrors the existing 🔊 Speaker READY log so both ends of
+    # the audio pipeline are visible in one place at boot.
+    try:
+        dev_info = sd.query_devices(mic.device, "input")
+        logger.info(
+            "🎙️ Mic READY | 16000 Hz | blocksize=%d (%.0fms) | "
+            "device='%s' | host_api=%s | "
+            "default_low_latency=%.1fms | default_high_latency=%.1fms",
+            MIC_CHUNK, MIC_CHUNK / 16.0,
+            dev_info.get("name", "unknown"),
+            dev_info.get("hostapi", "?"),
+            dev_info.get("default_low_input_latency", 0) * 1000,
+            dev_info.get("default_high_input_latency", 0) * 1000,
+        )
+    except Exception:
+        logger.info("🎙️ Mic READY | 16000 Hz | blocksize=%d", MIC_CHUNK)
+
     speaker_info = open_speaker()
     start_audio_worker(speaker_info[0])
 
@@ -1651,65 +1766,100 @@ async def run():
         + key
     )
 
+    logger.info(
+        "🚀 WALL-E BOOT | Live=%s | Vision=%s (Ollama:%s) | UART=%s | Memory=SQLite(%d turns)",
+        LIVE_MODEL,
+        VISION_ENABLED,
+        OLLAMA_VISION_MODEL or "NOT_SET",
+        SERIAL_PORT_DISPLAY,
+        MEMORY_TURNS,
+    )
+
+    # Open UART once during startup so the first command is fast.
+    await asyncio.to_thread(send_uart_command, "BOOT")
+    eye("EYES_NORMAL")
+
     try:
-        logger.info(
-            "🚀 WALL-E BOOT | Live=%s | Vision=%s (Ollama:%s) | UART=%s | Memory=SQLite(%d turns)",
-            LIVE_MODEL,
-            VISION_ENABLED,
-            OLLAMA_VISION_MODEL or "NOT_SET",
-            SERIAL_PORT_DISPLAY,
-            MEMORY_TURNS,
-        )
+        # --- Reconnect loop ---------------------------------------------
+        # BUG FIXED: this used to be a single `async with
+        # websockets.connect()` with no retry. The Gemini Live API can
+        # close a session normally (close code 1000 — e.g. a
+        # session-duration limit on the preview model), and that used to
+        # be indistinguishable from a real crash: the process would hang
+        # forever with no output (see the mic_loop fix above) until
+        # killed by hand. Mic and speaker hardware are opened ONCE,
+        # above, outside this loop, so a reconnect only redoes the cheap
+        # part (WebSocket handshake + setup message), not the audio
+        # devices.
+        #
+        # Backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s. Resets to 1s once
+        # a connection has stayed up >10s, so a real outage backs off
+        # politely but a one-off blip reconnects fast.
+        backoff = 1.0
+        connected_at = None
 
-        # Open UART once during startup so the first command is fast.
-        await asyncio.to_thread(send_uart_command, "BOOT")
+        while True:
+            try:
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=1,
+                    max_size=4 * 1024 * 1024,
+                ) as ws:
 
-        eye("EYES_NORMAL")
+                    await ws.send(dumps(setup))
+                    connected_at = time.monotonic()
+                    logger.info("🟢 Gemini Live READY")
 
-        async with websockets.connect(
-            url,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=1,
-            max_size=4 * 1024 * 1024,
-        ) as ws:
+                    # Stale audio from a previous connection must never
+                    # play into the new one.
+                    clear_audio_queue()
 
-            await ws.send(dumps(setup))
-
-            mic_task = asyncio.create_task(
-                mic_loop(ws, mic),
-                name="WALLE-Mic",
-            )
-
-            receive_task = asyncio.create_task(
-                receive_loop(ws, speaker_info),
-                name="WALLE-Gemini",
-            )
-
-            done, pending = await asyncio.wait(
-                {mic_task, receive_task},
-                return_when=asyncio.FIRST_EXCEPTION,
-            )
-
-            for task in pending:
-                task.cancel()
-
-            for task in done:
-                try:
-                    task.result()
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.exception(
-                        "❌ WALL-E task failed: %s",
-                        e,
+                    mic_task = asyncio.create_task(
+                        mic_loop(ws, mic),
+                        name="WALLE-Mic",
                     )
 
-    except Exception as e:
-        logger.exception(
-            "❌ Gemini Live connection failed: %s",
-            e,
-        )
+                    receive_task = asyncio.create_task(
+                        receive_loop(ws, speaker_info),
+                        name="WALLE-Gemini",
+                    )
+
+                    done, pending = await asyncio.wait(
+                        {mic_task, receive_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+
+                    for task in done:
+                        try:
+                            task.result()
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception as e:
+                            logger.warning("⚠️ WALL-E task ended: %s", e)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception as e:
+                logger.warning("❌ Gemini Live connection failed: %s", e)
+
+            # Connection ended (cleanly or not) — reconnect.
+            if connected_at is not None and (time.monotonic() - connected_at) > 10:
+                backoff = 1.0
+            connected_at = None
+
+            logger.info("🔄 Reconnecting to Gemini Live in %.0fs", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     finally:
         try:
@@ -1729,7 +1879,6 @@ async def run():
 
         eye("STOP")
         close_uart()
-        db_close()
 
         if vision_session and not vision_session.closed:
             await vision_session.close()

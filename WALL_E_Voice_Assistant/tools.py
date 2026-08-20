@@ -8,6 +8,7 @@ prints ESP32 ACK/log lines without blocking movement commands.
 """
 
 import os
+import sys
 import json
 import time
 import logging
@@ -23,6 +24,13 @@ logger = logging.getLogger("WALLE")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/serial0"))
+# NOTE: default was 9600 — the ESP32 UART firmware (WALL_E_ESP32_UART.ino)
+# hardcodes Serial2.begin(115200, ...). A 9600 default here means a fresh
+# .env following the README's own example (BAUD_RATE=9600) never talks to
+# the board at all: every write silently "succeeds" (serial.write doesn't
+# know the other side can't decode it) but no ACK ever comes back. Default
+# now matches the firmware. Still fully overridable via BAUD_RATE/.env if
+# a given board really is wired for 9600.
 BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "115200")))
 ENABLE_ESP32_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {
     "1", "true", "yes", "on"
@@ -33,10 +41,23 @@ _lock = threading.RLock()
 _reader_thread = None
 _reader_stop = None
 
+# BUG FIXED: _open_serial_locked() used to retry `serial.Serial(...)` on
+# EVERY single call whenever the port wasn't open — and eye() fires on
+# basically every turn boundary (talking/listening/normal), so a genuinely
+# absent/busy port meant a fresh failing open attempt (with its own
+# exception, traceback-free log line, and — on POSIX — nothing, but this
+# still burns an asyncio.to_thread() executor slot) right at the same
+# moments the audio worker most needs free scheduling headroom. A short
+# cooldown after a failed open turns "retry every single call forever"
+# into "retry a few times a minute", with zero change to behavior once
+# the port actually is available.
+_OPEN_RETRY_COOLDOWN_S = 3.0
+_last_open_attempt = 0.0
+
 
 def _open_serial_locked():
     """Open the USB serial port once and keep it open."""
-    global _ser, _reader_thread, _reader_stop
+    global _ser, _reader_thread, _reader_stop, _last_open_attempt
 
     if _ser is not None:
         try:
@@ -45,16 +66,32 @@ def _open_serial_locked():
         except Exception:
             _ser = None
 
+    now = time.monotonic()
+    if now - _last_open_attempt < _OPEN_RETRY_COOLDOWN_S:
+        return None
+    _last_open_attempt = now
+
     try:
         import serial
 
-        _ser = serial.Serial(
+        # BUG FIXED: `exclusive=False` is a POSIX-only pyserial option.
+        # On Windows, passing it at all (even False) raises
+        # ValueError("win32 only supports exclusive access (not: False)")
+        # from pyserial's win32 backend — every single UART command
+        # failed with that exact error on Windows dev machines, which is
+        # not a "no port" problem, it's this parameter. Only pass it on
+        # POSIX, where it's meaningful (lets other processes share the
+        # port for debugging).
+        serial_kwargs = dict(
             port=SERIAL_PORT,
             baudrate=BAUD,
             timeout=0.05,
             write_timeout=0.05,
-            exclusive=False,
         )
+        if sys.platform != "win32":
+            serial_kwargs["exclusive"] = False
+
+        _ser = serial.Serial(**serial_kwargs)
 
         # Opening USB serial can reset ESP32. Give firmware time to boot.
         time.sleep(0.35)
@@ -116,6 +153,8 @@ def _serial_reader(stop_event):
 
 def send_uart_command(command: str) -> bool:
     """Send one newline-delimited command to ESP32."""
+    global _ser
+
     cmd = (command or "").strip()
     if not cmd:
         return False
@@ -142,6 +181,14 @@ def send_uart_command(command: str) -> bool:
             return True
 
         except Exception as e:
+            # BUG FIXED: this assignment used to target a function-local
+            # `_ser` (no `global` declaration), so it never actually
+            # updated the module-level handle — the close() above worked,
+            # but marking the connection "gone" for the next call relied
+            # entirely on _open_serial_locked()'s own `.is_open` check
+            # happening to catch it. Declaring `global _ser` here makes
+            # the intent in the comment actually true, and skips one
+            # redundant is_open probe on the very next send.
             logger.error("❌ UART WRITE FAILED | command=%s | error=%s", cmd, e)
             try:
                 ser.close()
@@ -306,7 +353,7 @@ async def _search_web(query: str) -> str:
         return f"Search error: {e}"
 
 
-def _remember_fact_sync(fact: str) -> str:
+async def _remember_fact(fact: str) -> str:
     path = os.path.join(BASE, "memory.json")
     memories = []
 
@@ -339,16 +386,6 @@ def _remember_fact_sync(fact: str) -> str:
 
     except Exception as e:
         return f"Failed to memorize: {e}"
-
-
-async def _remember_fact(fact: str) -> str:
-    # This function is a coroutine, and the tool dispatcher awaits
-    # coroutines directly (assuming they don't block). The file I/O below
-    # is synchronous disk access — on Pi's SD card this can stall for real
-    # time under contention, blocking the ENTIRE asyncio event loop
-    # (mic reads, audio playback, everything) for that duration. Push it
-    # to a worker thread instead.
-    return await asyncio.to_thread(_remember_fact_sync, fact)
 
 
 TOOL_MAP = {
