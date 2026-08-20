@@ -25,6 +25,21 @@ _initialized = False
 
 
 def _connect():
+    """Reuses one connection per thread instead of opening fresh + re-running
+    all PRAGMAs on every single call. save_message() is called several
+    times per conversational turn (user, assistant, tool results) — on a
+    Pi's SD card, repeated open/close is real, avoidable overhead."""
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     conn = sqlite3.connect(
         DB_PATH,
         timeout=5.0,
@@ -33,6 +48,7 @@ def _connect():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    _local.conn = conn
     return conn
 
 
@@ -84,59 +100,53 @@ def save_message(role, content, session_id=None,
     init_db()
 
     conn = _connect()
-    try:
-        conn.execute(
-            """
-            INSERT INTO conversation
-            (ts, role, content, session_id, tool_name, tool_args, tool_result)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                time.time(),
-                role,
-                content or "",
-                session_id,
-                tool_name,
-                tool_args,
-                tool_result,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn.execute(
+        """
+        INSERT INTO conversation
+        (ts, role, content, session_id, tool_name, tool_args, tool_result)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            time.time(),
+            role,
+            content or "",
+            session_id,
+            tool_name,
+            tool_args,
+            tool_result,
+        ),
+    )
+    conn.commit()
 
 
 def get_recent_messages(limit=30, session_id=None):
     init_db()
 
     conn = _connect()
-    try:
-        if session_id:
-            rows = conn.execute(
-                """
-                SELECT role, content, tool_name, tool_result
-                FROM conversation
-                WHERE session_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (session_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT role, content, tool_name, tool_result
-                FROM conversation
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
+    if session_id:
+        rows = conn.execute(
+            """
+            SELECT role, content, tool_name, tool_result
+            FROM conversation
+            WHERE session_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (session_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT role, content, tool_name, tool_result
+            FROM conversation
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
-        rows.reverse()
-        return rows
-    finally:
-        conn.close()
+    rows.reverse()
+    return rows
 
 
 def format_recent_context(limit=30, session_id=None):
@@ -163,5 +173,10 @@ def format_recent_context(limit=30, session_id=None):
 
 
 def close():
-    # Connections are deliberately short-lived per operation. Nothing to close.
-    pass
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None

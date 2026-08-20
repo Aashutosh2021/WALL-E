@@ -19,6 +19,8 @@ import time
 import socket
 import inspect
 import collections
+import queue
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -44,7 +46,21 @@ from conversation_memory import (
     init_db,
     save_message,
     format_recent_context,
+    close as db_close,
 )
+
+
+async def _save_message_bg(*args, **kwargs):
+    """Fire-and-forget SQLite persistence. Called via asyncio.create_task
+    (never awaited directly) so a disk write can NEVER add latency to a
+    tool response or the turn-complete signal — those are what the user
+    (and Gemini's own turn-taking) actually waits on. Errors are logged
+    here since nothing else will ever observe this task's outcome."""
+    try:
+        await asyncio.to_thread(save_message, *args, **kwargs)
+    except Exception as e:
+        logger.warning("💾 MEMORY SAVE FAILED (background) | %s", e)
+
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +119,7 @@ LIVE_MODEL = os.getenv(
 )
 
 SERIAL_PORT_DISPLAY = os.getenv("SERIAL_PORT", "/dev/ttyUSB0")
-MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "30"))
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "20"))
 SESSION_ID = os.getenv("WALLE_SESSION_ID", "") or time.strftime(
     "%Y%m%d-%H%M%S"
 )
@@ -131,6 +147,226 @@ _vad_speech_started = False
 _vad_speech_printed = False
 _last_user_text_logged = ""
 _vad_speech_started_at = None  # Track when speech was first detected
+# Low-latency audio playback:
+# Gemini receive loop only enqueues PCM. A dedicated worker owns ALSA writes.
+_AUDIO_QUEUE_MAX = int(os.getenv("AUDIO_QUEUE_MAX", "250"))
+_audio_queue = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
+_audio_stop = threading.Event()
+_audio_worker = None
+_audio_stream = None
+_audio_playback_started = threading.Event()
+
+# 24 kHz mono int16: 960 samples = 40 ms. This is the target write size to
+# ALSA — large enough to avoid per-write overhead, small enough to match the
+# typical Gemini audio packet cadence and keep latency low.
+_WRITE_SAMPLES = 960
+_WRITE_BYTES = _WRITE_SAMPLES * 2  # int16 = 2 bytes/sample
+
+# Prebuffer ~80 ms (1920 samples) before the very first ALSA write so the
+# device ring buffer has enough data to start without an immediate underrun.
+_PREBUF_BYTES = _WRITE_SAMPLES * 2 * 2  # 2 blocks = 80 ms
+
+# Audio pipeline diagnostics (updated by the worker, read at turn-complete).
+_audio_stats_lock = threading.Lock()
+_audio_stats = {
+    "writes": 0,
+    "write_bytes": 0,
+    "write_time_ms": 0.0,
+    "max_write_ms": 0.0,
+    "underruns": 0,
+    "queue_peak": 0,
+    "queue_waits": 0,
+    "rx_chunks": 0,
+    "rx_bytes": 0,
+    "dropped": 0,
+    "last_report": 0.0,
+}
+
+
+def _reset_audio_stats():
+    with _audio_stats_lock:
+        for k in _audio_stats:
+            if k == "last_report":
+                _audio_stats[k] = time.monotonic()
+            else:
+                _audio_stats[k] = 0 if isinstance(_audio_stats[k], int) else 0.0
+
+
+def _report_audio_stats(force=False):
+    """Log aggregate audio stats every ~2 seconds during playback."""
+    with _audio_stats_lock:
+        now = time.monotonic()
+        if not force and (now - _audio_stats["last_report"]) < 2.0:
+            return
+        if _audio_stats["writes"] == 0 and not force:
+            return
+        s = dict(_audio_stats)
+        _audio_stats["last_report"] = now
+
+    avg_write = (s["write_time_ms"] / s["writes"]) if s["writes"] else 0
+    logger.info(
+        "📊 AUDIO STATS | writes=%d | bytes=%d | avg_write=%.1fms | "
+        "max_write=%.1fms | underruns=%d | q_peak=%d | q_waits=%d | "
+        "rx_chunks=%d | rx_bytes=%d | dropped=%d",
+        s["writes"], s["write_bytes"], avg_write, s["max_write_ms"],
+        s["underruns"], s["queue_peak"], s["queue_waits"],
+        s["rx_chunks"], s["rx_bytes"], s["dropped"],
+    )
+
+
+def _audio_worker_loop():
+    """Dedicated ALSA consumer — writes consistent ~40ms PCM blocks.
+
+    Key design decisions that prevent ALSA underruns on Pi 3B+:
+    1. Prebuffer 80ms before the first write so ALSA's ring buffer has data.
+    2. Write in fixed ~960-sample (40ms) blocks — never micro-writes.
+    3. Poll the queue every 5ms (not 50ms) so ALSA never starves.
+    4. When the queue goes empty during playback, flush whatever remains
+       in 'pending' so there is no trailing silence gap.
+    """
+    global _audio_stream
+
+    pending = bytearray()
+    started = False
+
+    def _write_block(data_bytes):
+        """Write one block to the ALSA device and track stats."""
+        nonlocal started
+        stream = _audio_stream
+        if stream is None:
+            return False
+        t0 = time.monotonic()
+        try:
+            stream.write(data_bytes)
+            elapsed = (time.monotonic() - t0) * 1000
+            started = True
+            with _audio_stats_lock:
+                _audio_stats["writes"] += 1
+                _audio_stats["write_bytes"] += len(data_bytes)
+                _audio_stats["write_time_ms"] += elapsed
+                if elapsed > _audio_stats["max_write_ms"]:
+                    _audio_stats["max_write_ms"] = elapsed
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "underrun" in err_str.lower() or "Underrun" in err_str:
+                with _audio_stats_lock:
+                    _audio_stats["underruns"] += 1
+                # Underrun recovery: ALSA auto-recovers, just keep writing.
+                return True
+            logger.warning("🔊 AUDIO WRITE ERROR | %s", e)
+            return False
+
+    def _drain_pending():
+        """Write as many full blocks from 'pending' as possible."""
+        while len(pending) >= _WRITE_BYTES:
+            block = bytes(pending[:_WRITE_BYTES])
+            del pending[:_WRITE_BYTES]
+            if not _write_block(block):
+                pending.clear()
+                return False
+        return True
+
+    while not _audio_stop.is_set():
+        try:
+            item = _audio_queue.get(timeout=0.005)  # 5ms — keeps ALSA fed
+        except queue.Empty:
+            with _audio_stats_lock:
+                _audio_stats["queue_waits"] += 1
+
+            # Queue is empty but we have leftover PCM from a previous packet.
+            # Flush it NOW instead of letting ALSA starve waiting for more.
+            if started and len(pending) > 0:
+                # Pad to even sample boundary (int16 = 2 bytes)
+                if len(pending) % 2:
+                    pending.append(0)
+                if len(pending) > 0:
+                    block = bytes(pending)
+                    pending.clear()
+                    _write_block(block)
+
+            _report_audio_stats()
+            continue
+
+        if item is None:
+            break
+
+        try:
+            pending.extend(item)
+
+            # Track queue depth
+            qsize = _audio_queue.qsize()
+            with _audio_stats_lock:
+                if qsize > _audio_stats["queue_peak"]:
+                    _audio_stats["queue_peak"] = qsize
+
+            if not started:
+                # Prebuffer: wait until we have ≥80ms before the first write.
+                if len(pending) < _PREBUF_BYTES:
+                    continue
+
+            # Write full blocks.
+            if not _drain_pending():
+                started = False
+
+        finally:
+            _audio_queue.task_done()
+
+    # Shutdown: flush anything remaining.
+    if len(pending) > 0 and _audio_stream is not None:
+        if len(pending) % 2:
+            pending.append(0)
+        _write_block(bytes(pending))
+    pending.clear()
+
+
+def start_audio_worker(stream):
+    global _audio_worker, _audio_stream
+    _audio_stream = stream
+    _audio_stop.clear()
+
+    if _audio_worker is None or not _audio_worker.is_alive():
+        _audio_worker = threading.Thread(
+            target=_audio_worker_loop,
+            name="WALLE-Audio-ALSA",
+            daemon=True,
+        )
+        _audio_worker.start()
+
+
+def clear_audio_queue():
+    """Drop stale AI audio so an old response can never delay a new command."""
+    dropped = 0
+    while True:
+        try:
+            _audio_queue.get_nowait()
+            _audio_queue.task_done()
+            dropped += 1
+        except queue.Empty:
+            break
+
+    if dropped:
+        logger.info("🔊 AUDIO QUEUE CLEAR | dropped=%d chunks", dropped)
+
+
+def stop_audio_worker():
+    global _audio_worker, _audio_stream
+    _audio_stop.set()
+
+    try:
+        _audio_queue.put_nowait(None)
+    except queue.Full:
+        clear_audio_queue()
+        try:
+            _audio_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    if _audio_worker is not None and _audio_worker.is_alive():
+        _audio_worker.join(timeout=1.0)
+
+    _audio_worker = None
+    _audio_stream = None
 
 
 def _stamp():
@@ -405,18 +641,48 @@ def eye(state):
 # ---------------------------------------------------------------------------
 
 def open_speaker():
+    # Gemini Live PCM is 24 kHz mono int16.
+    #
+    # KEY DESIGN DECISIONS to prevent ALSA underruns on Pi 3B+:
+    #
+    # 1. Do NOT set blocksize. With blocksize set, PortAudio's blocking-write
+    #    API only accepts writes aligned to that blocksize, causing the audio
+    #    worker's variable-size writes to trigger partial fills → underruns.
+    #    Without blocksize, ALSA accepts whatever we give it immediately.
+    #
+    # 2. Use latency=0.1 (100ms ring buffer), NOT "high" (~500ms+). A 100ms
+    #    buffer is large enough to absorb network jitter and Python GIL
+    #    scheduling, but small enough to keep perceived playback latency low.
+    #
+    # 3. 48000 Hz is only a fallback with explicit 2x sample replication.
     for rate in (24000, 48000):
         try:
             s = sd.RawOutputStream(
                 samplerate=rate,
                 channels=1,
                 dtype="int16",
+                latency=0.1,  # 100ms ALSA ring buffer
             )
             s.start()
-            logger.info("🔊 Speaker READY | %d Hz", rate)
+
+            # Log actual device parameters for diagnostics.
+            try:
+                dev_info = sd.query_devices(s.device, "output")
+                logger.info(
+                    "🔊 Speaker READY | %d Hz | latency=100ms | "
+                    "device='%s' | host_api=%s | "
+                    "default_low_latency=%.1fms | default_high_latency=%.1fms",
+                    rate,
+                    dev_info.get("name", "unknown"),
+                    dev_info.get("hostapi", "?"),
+                    dev_info.get("default_low_output_latency", 0) * 1000,
+                    dev_info.get("default_high_output_latency", 0) * 1000,
+                )
+            except Exception:
+                logger.info("🔊 Speaker READY | %d Hz | latency=100ms", rate)
             return s, rate
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("🔊 Speaker open failed | rate=%d | %s", rate, e)
 
     logger.warning("🔊 Speaker stream unavailable")
     return None, 24000
@@ -451,8 +717,14 @@ async def mic_loop(ws, mic):
     
     silence_count = 0
     
+    """Continuously forward microphone PCM to Gemini with minimal scheduling delay."""
+    loop = asyncio.get_running_loop()
+    tx_count = 0
+
     while True:
         try:
+            t_capture = time.monotonic()
+
             data, _ = await loop.run_in_executor(
                 None,
                 mic.read,
@@ -489,27 +761,41 @@ async def mic_loop(ws, mic):
                 # Send audio to Gemini
                 await ws.send(
                     dumps(
+            if not data:
+                continue
+
+            # IMPORTANT: Do not gate microphone input on is_ai_speaking.
+            # Gating it caused user speech to be silently discarded while
+            # WALL-E was speaking and could create huge apparent delays.
+            payload = {
+                "realtimeInput": {
+                    "mediaChunks": [
                         {
-                            "realtimeInput": {
-                                "mediaChunks": [
-                                    {
-                                        "mimeType": "audio/pcm;rate=16000",
-                                        "data": base64.b64encode(
-                                            bytes(data)
-                                        ).decode(),
-                                    }
-                                ]
-                            }
+                            "mimeType": "audio/pcm;rate=16000",
+                            "data": base64.b64encode(bytes(data)).decode(),
                         }
-                    )
+                    ]
+                }
+            }
+
+            t_send = time.monotonic()
+            await ws.send(dumps(payload))
+            tx_count += 1
+
+            # Log only periodically to avoid flooding the Pi terminal.
+            if tx_count % 100 == 0:
+                logger.info(
+                    "🎙️ MIC PIPELINE | chunks=%d | capture→send=%.1f ms",
+                    tx_count,
+                    (time.monotonic() - t_capture) * 1000,
                 )
 
         except asyncio.CancelledError:
             return
 
         except Exception as e:
-            logger.warning("🎤 Mic loop stopped: %s", e)
-            return
+            logger.warning("🎤 MIC LOOP ERROR | %s", e)
+            await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -764,9 +1050,8 @@ async def handle_other_tool(call):
             result,
         )
 
-        try:
-            await asyncio.to_thread(
-                save_message,
+        asyncio.create_task(
+            _save_message_bg(
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -774,8 +1059,7 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        except Exception as e:
-            logger.warning("💾 MEMORY SAVE VISION FAILED | %s", e)
+        )
 
         return result
 
@@ -801,9 +1085,8 @@ async def handle_other_tool(call):
             result,
         )
 
-        try:
-            await asyncio.to_thread(
-                save_message,
+        asyncio.create_task(
+            _save_message_bg(
                 "tool",
                 str(result),
                 SESSION_ID,
@@ -811,8 +1094,7 @@ async def handle_other_tool(call):
                 json.dumps(args, ensure_ascii=False),
                 str(result),
             )
-        except Exception as e:
-            logger.warning("💾 MEMORY SAVE TOOL FAILED | %s", e)
+        )
 
         return result
 
@@ -876,6 +1158,7 @@ async def receive_loop(ws, speaker_info):
                                 _latency_ms(_vad_speech_started_at, now),
                                 _latency_ms(_vad_speech_started_at, now) / 1000.0
                             )
+                        _reset_audio_stats()
 
                     _user_transcript_parts.append(text)
                     
@@ -910,6 +1193,20 @@ async def receive_loop(ws, speaker_info):
 
                         )
 
+                        # Print the user's COMPLETE sentence right here —
+                        # the moment AI starts responding, not after the AI
+                        # finishes its entire spoken reply. Gemini starting
+                        # its output IS the signal that the user's turn is
+                        # done; waiting for turnComplete to show this made a
+                        # 1-2s recognition look like an 8s delay.
+                        user_so_far = "".join(_user_transcript_parts).strip()
+                        if user_so_far:
+                            logger.info(
+                                "👤 USER FINAL [%s] | %s",
+                                _stamp(),
+                                user_so_far,
+                            )
+
                     _ai_transcript_parts.append(text)
 
                     # INSTANT print of AI response (every chunk)
@@ -925,6 +1222,7 @@ async def receive_loop(ws, speaker_info):
 
             if sc.get("interrupted"):
                 logger.info("⛔ AI TURN INTERRUPTED")
+                clear_audio_queue()
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
 
@@ -958,11 +1256,28 @@ async def receive_loop(ws, speaker_info):
                             audio = resample24to48(audio)
 
                         if speaker:
-                            await loop.run_in_executor(
-                                None,
-                                speaker.write,
-                                audio,
-                            )
+                            # Never write to ALSA from the Gemini WebSocket
+                            # receive coroutine. Queue it for the dedicated
+                            # playback worker.
+                            with _audio_stats_lock:
+                                _audio_stats["rx_chunks"] += 1
+                                _audio_stats["rx_bytes"] += len(audio)
+                            try:
+                                _audio_queue.put_nowait(audio)
+                            except queue.Full:
+                                # Stale audio is worse than dropping one chunk:
+                                # keep the robot responsive to the current turn.
+                                with _audio_stats_lock:
+                                    _audio_stats["dropped"] += 1
+                                try:
+                                    _audio_queue.get_nowait()
+                                    _audio_queue.task_done()
+                                except queue.Empty:
+                                    pass
+                                try:
+                                    _audio_queue.put_nowait(audio)
+                                except queue.Full:
+                                    pass
 
             if sc.get("turnComplete"):
                 # Final turn summaries.
@@ -970,8 +1285,8 @@ async def receive_loop(ws, speaker_info):
                 ai_text = "".join(_ai_transcript_parts).strip()
 
                 if user_text:
-                    logger.info(
-                        "👤 USER FINAL [%s] | %s",
+                    logger.debug(
+                        "👤 USER FINAL (turn-complete, already shown) [%s] | %s",
                         _stamp(),
                         user_text,
                     )
@@ -979,41 +1294,35 @@ async def receive_loop(ws, speaker_info):
                 if ai_text:
                     log_ai(ai_text)
 
-                # Persist the completed conversational turn.
-                # SQLite WAL keeps this fast and crash-safe enough for Pi use.
+                # Persist the completed conversational turn — fire-and-forget.
+                # These used to be awaited HERE, sequentially, meaning the
+                # "turn complete" latency number included two full SQLite
+                # open+write round trips that have zero bearing on what the
+                # user actually experienced (they'd already heard the reply).
                 if user_text:
-                    try:
-                        await asyncio.to_thread(
-                            save_message,
-                            "user",
-                            user_text,
-                            SESSION_ID,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "💾 MEMORY SAVE USER FAILED | %s",
-                            e,
-                        )
+                    asyncio.create_task(
+                        _save_message_bg("user", user_text, SESSION_ID)
+                    )
 
                 if ai_text:
-                    try:
-                        await asyncio.to_thread(
-                            save_message,
-                            "assistant",
-                            ai_text,
-                            SESSION_ID,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "💾 MEMORY SAVE AI FAILED | %s",
-                            e,
-                        )
+                    asyncio.create_task(
+                        _save_message_bg("assistant", ai_text, SESSION_ID)
+                    )
 
                 _user_transcript_parts.clear()
                 _ai_transcript_parts.clear()
 
                 is_ai_speaking = False
                 eye("EYES_NORMAL")
+
+                # Measure latency HERE — right after the state the user
+                # actually perceives is settled, BEFORE the IMG_CLEAR
+                # bookkeeping below (which the user never waits on).
+                if _turn_started_at is not None:
+                    _log_latency(
+                        "user first transcript → turn complete",
+                        _latency_ms(_turn_started_at),
+                    )
 
                 # Clear the ESP32 image ONLY after a successful image-analysis turn.
                 if _image_analysis_active and _image_analysis_completed:
@@ -1030,11 +1339,14 @@ async def receive_loop(ws, speaker_info):
                         "IMG_CLEAR NOT SENT"
                     )
 
-                if _turn_started_at is not None:
-                    _log_latency(
-                        "user first transcript → turn complete",
-                        _latency_ms(_turn_started_at),
-                    )
+                logger.info(
+                    "📊 TURN STATS | user=%d chars | ai=%d chars | "
+                    "audio_queue=%d | mic_continuous=True",
+                    len(user_text),
+                    len(ai_text),
+                    _audio_queue.qsize(),
+                )
+                _report_audio_stats(force=True)
 
                 _image_analysis_active = False
                 _image_analysis_completed = False
@@ -1108,9 +1420,17 @@ async def receive_loop(ws, speaker_info):
             else:
                 result = f"Invalid direction '{d}'."
 
-            try:
-                await asyncio.to_thread(
-                    save_message,
+            # send_tool_response FIRST — this is what Gemini is waiting on
+            # to continue the conversation. The DB write has zero bearing
+            # on that and must never sit in front of it.
+            await send_tool_response(
+                ws,
+                cid,
+                result,
+            )
+
+            asyncio.create_task(
+                _save_message_bg(
                     "tool",
                     str(result),
                     SESSION_ID,
@@ -1118,13 +1438,6 @@ async def receive_loop(ws, speaker_info):
                     json.dumps(args, ensure_ascii=False),
                     str(result),
                 )
-            except Exception as e:
-                logger.warning("💾 MEMORY SAVE MOVE FAILED | %s", e)
-
-            await send_tool_response(
-                ws,
-                cid,
-                result,
             )
 
         # Other tools are handled after movement.
@@ -1187,7 +1500,13 @@ async def run():
     if recent_conversation:
         memory_text += "\n\n" + recent_conversation
 
-    instruction = AGENT_INSTRUCTION + memory_text
+    instruction = (
+        AGENT_INSTRUCTION
+        + "\n\nLATENCY RULES: For movement/tool commands, act immediately. "
+          "Do not add explanations before calling the tool. Keep spoken "
+          "confirmation to one short sentence after the tool succeeds."
+        + memory_text
+    )
 
     setup = {
         "setup": {
@@ -1198,6 +1517,7 @@ async def run():
 
             "generationConfig": {
                 "responseModalities": ["AUDIO"],
+                "temperature": 0.25,
                 "speechConfig": {
                     "voiceConfig": {
                         "prebuiltVoiceConfig": {
@@ -1322,6 +1642,7 @@ async def run():
     mic.start()
 
     speaker_info = open_speaker()
+    start_audio_worker(speaker_info[0])
 
     url = (
         "wss://generativelanguage.googleapis.com/ws/"
@@ -1397,6 +1718,8 @@ async def run():
         except Exception:
             pass
 
+        stop_audio_worker()
+
         if speaker_info[0]:
             try:
                 speaker_info[0].stop()
@@ -1406,6 +1729,7 @@ async def run():
 
         eye("STOP")
         close_uart()
+        db_close()
 
         if vision_session and not vision_session.closed:
             await vision_session.close()
