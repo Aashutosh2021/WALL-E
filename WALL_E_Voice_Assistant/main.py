@@ -17,11 +17,11 @@ try:
 except ImportError:
     pass  # Falls back to the default asyncio loop — still correct, just slower.
 
-from walle_direct_gemini import run
+from walle_direct_gemini import run_session
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run())
+        asyncio.run(run_session())
     except KeyboardInterrupt:
         print("WALL-E stopped.")
