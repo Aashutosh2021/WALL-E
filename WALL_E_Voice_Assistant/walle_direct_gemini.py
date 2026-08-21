@@ -1,14 +1,18 @@
 """
-WALL-E — Raspberry Pi Voice Assistant (MJ-architecture based)
-- Speaker thread + bounded TTL queue (receive loop never blocks)
-- Mic callback + async bounded TTL queue (stale audio drops)
-- Speaker-state echo gating (queue + tail based is_active)
-- Gemini Live websocket with reconnect loop
-- ESP32 UART eyes + motor tools (Windows + Pi compatible)
-- Vision: OLLAMA ONLY (/api/generate with persistent session)
+WALL-E — Gemini Live realtime voice assistant.
+
+Architecture:
+- Speaker thread + bounded TTL queue  -> receive loop never blocks on audio.
+- Mic callback + async bounded TTL queue -> stale audio drops, no backlog.
+- Speaker-state echo gating (queue + tail based is_active).
+- Gemini Live websocket with auto-reconnect loop.
+- ESP32 UART eyes + motor via tools.py  (canonical fixed UART layer).
+- Vision: Ollama /api/generate (persistent aiohttp session).
+- Memory: conversation_memory.py (SQLite/WAL).
+- Prompt: prompts.AGENT_INSTRUCTION.
 """
 
-# Force IPv4 to reduce DNS/handshake latency issues.
+# Force IPv4 to avoid IPv6 handshake timeouts on some networks.
 import socket
 
 _orig_getaddrinfo = socket.getaddrinfo
@@ -16,27 +20,32 @@ _orig_getaddrinfo = socket.getaddrinfo
 
 def _custom_getaddrinfo(*args, **kwargs):
     responses = _orig_getaddrinfo(*args, **kwargs)
-    ipv4_responses = [r for r in responses if r[0] == socket.AF_INET]
-    return ipv4_responses if ipv4_responses else responses
+    ipv4 = [r for r in responses if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else responses
 
 
 socket.getaddrinfo = _custom_getaddrinfo
 
-import asyncio
-import base64
-import json
-import logging
 import os
-import pathlib
-import queue
 import re
-import shutil
-import subprocess
 import sys
-import threading
+import json
 import time
+import queue
+import base64
+import shutil
+import logging
+import asyncio
+import inspect
+import threading
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+
+import numpy as np
+import sounddevice as sd
+import websockets
+import aiohttp
 
 try:
     import orjson
@@ -47,65 +56,24 @@ except ImportError:
     dumps = json.dumps
     loads = json.loads
 
-import numpy as np
-import sounddevice as sd
-import websockets
+# Load .env BEFORE importing project modules (tools.py reads env at import).
+from dotenv import load_dotenv
 
-try:
-    import aiohttp
-except ImportError:
-    aiohttp = None
+load_dotenv(override=True)
 
-try:
-    import serial
-except ImportError:
-    serial = None
-
-if hasattr(sys.stdout, "reconfigure"):
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# Project modules.
+from prompts import AGENT_INSTRUCTION
+from tools import send_uart_command, TOOL_MAP, close_uart
+from conversation_memory import (
+    init_db,
+    save_message,
+    format_recent_context,
+)
 
 
 # ---------------------------------------------------------------------------
-# .env loader
+# Logging
 # ---------------------------------------------------------------------------
-def _load_dotenv():
-    candidates = []
-
-    try:
-        base = pathlib.Path(__file__).resolve().parent
-        candidates.append(pathlib.Path.cwd() / ".env")
-        candidates.append(base / ".env")
-        candidates.append(base.parent / ".env")
-    except Exception:
-        pass
-
-    for env_path in candidates:
-        try:
-            if not env_path.exists():
-                continue
-
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip().strip('"').strip("'")
-
-                if key and val and os.getenv(key) is None:
-                    os.environ[key] = val
-        except Exception:
-            pass
-
-
-_load_dotenv()
-
-
 def _env_bool(name, default="0"):
     return str(os.getenv(name, default)).strip().lower() in {
         "1",
@@ -113,6 +81,22 @@ def _env_bool(name, default="0"):
         "yes",
         "on",
     }
+
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s  %(levelname)-7s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+logger = logging.getLogger("WALL-E")
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+# Persistent conversation DB.
+init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -161,39 +145,18 @@ except Exception:
 
 ALLOW_BARGE_IN = _env_bool("ALLOW_BARGE_IN", "0")
 ENABLE_VISION = _env_bool("ENABLE_VISION", "1")
-ENABLE_MEMORY = _env_bool("ENABLE_MEMORY", "0")
 ENABLE_ESP32_IMAGE = _env_bool("ENABLE_ESP32_IMAGE", "0")
-
-SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0").strip()
-BAUD_RATE = int(os.getenv("BAUD_RATE", "115200"))
-
-REALTIME_INPUT_FIELD = os.getenv(
-    "REALTIME_INPUT_FIELD", "mediaChunks"
-).strip().lower()
+ENABLE_GREETING = _env_bool("ENABLE_GREETING", "1")
 
 VOICE_NAME = os.getenv("VOICE_NAME", "Puck").strip()
-GREETING_TRIGGER = os.getenv("GREETING_TRIGGER", "").strip()
 
-# Ollama vision (ONLY vision backend)
-OLLAMA_CLOUD_URL = os.getenv(
-    "OLLAMA_CLOUD_URL",
-    "https://ollama.com",
-).rstrip("/")
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "30"))
+SESSION_ID = os.getenv("WALLE_SESSION_ID", "") or time.strftime("%Y%m%d-%H%M%S")
+
+# Ollama vision (ONLY vision backend).
+OLLAMA_CLOUD_URL = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com").rstrip("/")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "").strip()
-
-MEMORY_FILE = pathlib.Path(os.getenv("WALL_MEMORY_FILE", "wall_memory.json"))
-MEMORY_LIMIT = int(os.getenv("MEMORY_LIMIT", "100"))
-
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    datefmt="%H:%M:%S",
-)
-
-log = logging.getLogger("WALL-E")
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +168,265 @@ tool_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tool")
 
 
 # ---------------------------------------------------------------------------
-# Queues with TTL
+# Runtime state
+# ---------------------------------------------------------------------------
+is_ai_speaking = False
+_current_eye = None
+
+_user_transcript_parts = []
+_ai_transcript_parts = []
+
+_image_analysis_active = False
+_image_analysis_completed = False
+
+
+def _stamp():
+    return time.strftime("%H:%M:%S.") + f"{int((time.time() % 1) * 1000):03d}"
+
+
+def log_user(text):
+    text = (text or "").strip()
+    if text:
+        logger.info("👤 USER [%s] | %s", _stamp(), text)
+
+
+def log_ai(text):
+    text = (text or "").strip()
+    if text:
+        logger.info("🤖 AI [%s] | %s", _stamp(), text)
+
+
+def log_tool(name, args):
+    logger.info("🛠️ TOOL CALL [%s] | %s | args=%s", _stamp(), name, args)
+
+
+def merge_transcripts(old_text, new_text):
+    old_clean = (old_text or "").strip()
+    new_clean = (new_text or "").strip()
+
+    if not old_clean:
+        return new_clean
+    if not new_clean:
+        return old_clean
+    if new_clean.startswith(old_clean):
+        return new_clean
+
+    max_overlap = min(len(old_clean), len(new_clean))
+    for i in range(max_overlap, 0, -1):
+        if old_clean.endswith(new_clean[:i]):
+            return old_clean + new_clean[i:]
+
+    return old_clean + " " + new_clean
+
+
+# ---------------------------------------------------------------------------
+# OLED eyes (via tools.py UART layer)
+# ---------------------------------------------------------------------------
+def eye(state):
+    global _current_eye
+
+    valid = {
+        "BOOT",
+        "IDLE",
+        "LISTEN",
+        "THINK",
+        "SPEAK",
+        "EYES_TALKING",
+        "EYES_NORMAL",
+        "HAPPY",
+        "SAD",
+        "ANGRY",
+    }
+
+    if state not in valid or state == _current_eye:
+        return
+
+    _current_eye = state
+    logger.info("👁️ EYE | %s", state)
+
+    try:
+        uart_executor.submit(send_uart_command, state)
+    except Exception as e:
+        logger.warning("Eye UART submit failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+try:
+    from picamera2 import Picamera2
+
+    HAS_PICAM2 = True
+except ImportError:
+    Picamera2 = None
+    HAS_PICAM2 = False
+
+HAS_RPICAM = shutil.which("rpicam-still") is not None
+HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
+
+
+class Camera:
+    def __init__(self):
+        self.picam = None
+        self.cap = None
+
+        if HAS_PICAM2:
+            try:
+                self.picam = Picamera2()
+                cfg = self.picam.create_still_configuration(
+                    main={"size": (320, 240), "format": "RGB888"}
+                )
+                self.picam.configure(cfg)
+                self.picam.start()
+                time.sleep(0.15)
+                logger.info("📷 Camera READY | persistent picamera2 | 320x240")
+            except Exception as e:
+                logger.warning("picamera2 unavailable: %s", e)
+                self.picam = None
+
+        if self.picam is None:
+            logger.info(
+                "📷 Camera fallback | %s",
+                "rpicam-still"
+                if HAS_RPICAM
+                else "libcamera-still"
+                if HAS_LIBCAMERA
+                else "OpenCV",
+            )
+
+    def grab(self):
+        """Capture a fresh frame, dropping buffered frames first."""
+        t0 = time.monotonic()
+
+        try:
+            import cv2
+
+            if self.picam is not None:
+                self.picam.capture_array("main")
+                self.picam.capture_array("main")
+                frame = self.picam.capture_array("main")
+
+                ok, buf = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 50],
+                )
+                if not ok:
+                    return None
+
+                jpeg = buf.tobytes()
+                logger.info(
+                    "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
+                    len(jpeg),
+                    (time.monotonic() - t0) * 1000.0,
+                )
+                return jpeg
+
+            if HAS_RPICAM:
+                r = subprocess.run(
+                    [
+                        "rpicam-still",
+                        "--output", "-",
+                        "--width", "320",
+                        "--height", "240",
+                        "--quality", "50",
+                        "--nopreview",
+                        "--immediate", "1",
+                        "--encoding", "jpg",
+                        "--timeout", "1",
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if r.returncode == 0 and len(r.stdout) > 100:
+                    logger.info(
+                        "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
+                        len(r.stdout),
+                        (time.monotonic() - t0) * 1000.0,
+                    )
+                    return r.stdout
+                return None
+
+            if HAS_LIBCAMERA:
+                r = subprocess.run(
+                    [
+                        "libcamera-still",
+                        "--output", "-",
+                        "--width", "320",
+                        "--height", "240",
+                        "--quality", "50",
+                        "--nopreview",
+                        "--immediate",
+                        "--encoding", "jpg",
+                        "--timeout", "1",
+                    ],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if r.returncode == 0 and len(r.stdout) > 100:
+                    logger.info(
+                        "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
+                        len(r.stdout),
+                        (time.monotonic() - t0) * 1000.0,
+                    )
+                    return r.stdout
+                return None
+
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(0)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            self.cap.grab()
+            self.cap.grab()
+            ok, frame = self.cap.read()
+            if not ok:
+                return None
+
+            ok, buf = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 50],
+            )
+            if not ok:
+                return None
+
+            jpeg = buf.tobytes()
+            logger.info(
+                "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
+                len(jpeg),
+                (time.monotonic() - t0) * 1000.0,
+            )
+            return jpeg
+
+        except Exception as e:
+            logger.exception("❌ CAMERA CAPTURE FAILED | %s", e)
+            return None
+
+    def close(self):
+        if self.picam:
+            try:
+                self.picam.stop()
+                self.picam.close()
+            except Exception:
+                pass
+
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+
+camera = Camera()
+
+
+# ---------------------------------------------------------------------------
+# Bounded TTL queues
 # ---------------------------------------------------------------------------
 class BoundedTimeQueue:
-    """Thread-safe bounded queue with TTL aging."""
+    """Thread-safe bounded queue with TTL aging (drop-oldest on overload)."""
 
     def __init__(self, maxsize, ttl_seconds):
         self.maxsize = maxsize
@@ -223,17 +441,14 @@ class BoundedTimeQueue:
                     self.queue.get_nowait()
                 except queue.Empty:
                     pass
-
             self.queue.put((item, time.time()))
 
     def get(self, timeout=0.05):
         while True:
             item_data, timestamp = self.queue.get(timeout=timeout)
-
             if time.time() - timestamp < self.ttl:
                 return item_data
-
-            log.warning(
+            logger.warning(
                 "⏱️ Speaker queue discarded stale chunk | age=%.2fs",
                 time.time() - timestamp,
             )
@@ -254,7 +469,7 @@ class BoundedTimeQueue:
 
 
 class AsyncBoundedTimeQueue:
-    """Async bounded queue with TTL aging."""
+    """Async bounded queue with TTL aging (drop-oldest on overload)."""
 
     def __init__(self, maxsize, ttl_seconds):
         self.maxsize = maxsize
@@ -267,17 +482,14 @@ class AsyncBoundedTimeQueue:
                 self.queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
-
         self.queue.put_nowait((item, time.time()))
 
     async def get(self):
         while True:
             item_data, timestamp = await self.queue.get()
-
             if time.time() - timestamp < self.ttl:
                 return item_data
-
-            log.warning(
+            logger.warning(
                 "⏱️ Mic queue discarded stale chunk | age=%.2fs",
                 time.time() - timestamp,
             )
@@ -285,7 +497,6 @@ class AsyncBoundedTimeQueue:
     def get_nowait(self):
         while True:
             item_data, timestamp = self.queue.get_nowait()
-
             if time.time() - timestamp < self.ttl:
                 return item_data
 
@@ -307,578 +518,18 @@ class AsyncBoundedTimeQueue:
 
 
 # ---------------------------------------------------------------------------
-# Memory
-# ---------------------------------------------------------------------------
-def safe_read_memory():
-    if not MEMORY_FILE.exists() or MEMORY_FILE.stat().st_size == 0:
-        return []
-
-    for _ in range(3):
-        try:
-            content = MEMORY_FILE.read_text(encoding="utf-8").strip()
-            if not content:
-                return []
-
-            data = json.loads(content)
-            if isinstance(data, list):
-                return data
-
-            return []
-        except Exception:
-            time.sleep(0.05)
-
-    return []
-
-
-def safe_save_memory_list(history):
-    try:
-        MEMORY_FILE.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return True
-    except Exception:
-        return False
-
-
-def save_memory(user_text, assistant_text):
-    if not ENABLE_MEMORY:
-        return
-
-    try:
-        history = safe_read_memory()
-        ts = datetime.now().isoformat()
-
-        history.append(
-            {"role": "user", "content": user_text.strip(), "timestamp": ts}
-        )
-        history.append(
-            {"role": "assistant", "content": assistant_text.strip(), "timestamp": ts}
-        )
-
-        if len(history) > MEMORY_LIMIT:
-            history = history[-MEMORY_LIMIT:]
-
-        if safe_save_memory_list(history):
-            log.debug("💾 Memory saved | %d entries", len(history))
-        else:
-            log.warning("⚠️ Memory save failed")
-    except Exception as e:
-        log.warning("⚠️ Memory save failed: %s", e)
-
-
-def merge_transcripts(old_text, new_text):
-    old_clean = (old_text or "").strip()
-    new_clean = (new_text or "").strip()
-
-    if not old_clean:
-        return new_clean
-
-    if not new_clean:
-        return old_clean
-
-    if new_clean.startswith(old_clean):
-        return new_clean
-
-    max_overlap = min(len(old_clean), len(new_clean))
-
-    for i in range(max_overlap, 0, -1):
-        if old_clean.endswith(new_clean[:i]):
-            return old_clean + new_clean[i:]
-
-    return old_clean + " " + new_clean
-
-
-# ---------------------------------------------------------------------------
-# UART / ESP32 (Windows + Pi compatible)
-# ---------------------------------------------------------------------------
-_ser = None
-_ser_lock = threading.RLock()
-_reader_thread = None
-_reader_stop = None
-
-
-def _open_serial_locked():
-    global _ser, _reader_thread, _reader_stop
-
-    if _ser is not None:
-        try:
-            if _ser.is_open:
-                return _ser
-        except Exception:
-            _ser = None
-
-    if serial is None:
-        log.error("❌ pyserial not installed")
-        return None
-
-    try:
-        # NOTE: no `exclusive` argument — win32 requires exclusive access,
-        # Linux default is fine.
-        _ser = serial.Serial(
-            port=SERIAL_PORT,
-            baudrate=BAUD_RATE,
-            timeout=0.05,
-            write_timeout=0.05,
-        )
-
-        # Opening serial can reset ESP32. Give it boot time.
-        time.sleep(0.35)
-
-        try:
-            _ser.reset_input_buffer()
-        except Exception:
-            pass
-
-        log.info(
-            "🔌 ESP32 UART CONNECTED | port=%s | baud=%d",
-            SERIAL_PORT,
-            BAUD_RATE,
-        )
-
-        if _reader_thread is None or not _reader_thread.is_alive():
-            _reader_stop = threading.Event()
-            _reader_thread = threading.Thread(
-                target=_serial_reader,
-                args=(_reader_stop,),
-                daemon=True,
-                name="ESP32-UART-Reader",
-            )
-            _reader_thread.start()
-
-        return _ser
-
-    except Exception as e:
-        log.error(
-            "❌ ESP32 UART OPEN FAILED | port=%s | error=%s",
-            SERIAL_PORT,
-            e,
-        )
-        _ser = None
-        return None
-
-
-def _serial_reader(stop_event):
-    global _ser
-
-    while not stop_event.is_set():
-        try:
-            ser = _ser
-
-            if ser is None or not ser.is_open:
-                stop_event.wait(0.1)
-                continue
-
-            raw = ser.readline()
-            if not raw:
-                continue
-
-            text = raw.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-
-            if text.startswith("ACK_"):
-                log.info("📥 ESP32 ACK | %s", text)
-            else:
-                log.info("📥 ESP32 LOG | %s", text)
-
-        except Exception as e:
-            if not stop_event.is_set():
-                log.debug("UART reader: %s", e)
-
-            time.sleep(0.1)
-
-
-def send_uart_command(command):
-    cmd = (command or "").strip()
-
-    if not cmd:
-        return False
-
-    if cmd.startswith("IMG:") and not ENABLE_ESP32_IMAGE:
-        log.debug("UART image skipped because ENABLE_ESP32_IMAGE=0")
-        return False
-
-    payload = (cmd + "\n").encode("utf-8")
-
-    with _ser_lock:
-        ser = _open_serial_locked()
-
-        if ser is None:
-            return False
-
-        try:
-            t0 = time.monotonic()
-            ser.write(payload)
-            ser.flush()
-
-            elapsed = (time.monotonic() - t0) * 1000.0
-            display_cmd = "IMG:<base64>" if cmd.startswith("IMG:") else cmd
-
-            log.info("📤 ESP32 TX | %s | %.1f ms", display_cmd, elapsed)
-
-            return True
-
-        except Exception as e:
-            log.error(
-                "❌ UART WRITE FAILED | command=%s | error=%s",
-                cmd,
-                e,
-            )
-
-            try:
-                ser.close()
-            except Exception:
-                pass
-
-            _ser = None
-            return False
-
-
-def close_uart():
-    global _ser, _reader_thread, _reader_stop
-
-    with _ser_lock:
-        if _reader_stop is not None:
-            _reader_stop.set()
-
-        if _ser is not None:
-            try:
-                _ser.close()
-            except Exception:
-                pass
-
-        _ser = None
-        _reader_thread = None
-        _reader_stop = None
-
-
-_current_eye = None
-
-
-def eye(state):
-    global _current_eye
-
-    valid = {
-        "BOOT",
-        "IDLE",
-        "LISTEN",
-        "THINK",
-        "SPEAK",
-        "EYES_TALKING",
-        "EYES_NORMAL",
-        "STOP",
-        "HAPPY",
-        "SAD",
-        "ANGRY",
-    }
-
-    if state not in valid or state == _current_eye:
-        return
-
-    _current_eye = state
-    log.info("👁️ EYE | %s", state)
-
-    try:
-        uart_executor.submit(send_uart_command, state)
-    except Exception as e:
-        log.warning("Eye UART submit failed: %s", e)
-
-
-# ---------------------------------------------------------------------------
-# Camera
-# ---------------------------------------------------------------------------
-HAS_RPICAM = shutil.which("rpicam-still") is not None
-HAS_LIBCAMERA = shutil.which("libcamera-still") is not None
-
-
-class Camera:
-    def __init__(self):
-        self.cap = None
-
-    def grab(self):
-        if not ENABLE_VISION:
-            return None
-
-        t0 = time.monotonic()
-
-        if HAS_RPICAM:
-            try:
-                r = subprocess.run(
-                    [
-                        "rpicam-still",
-                        "--output", "-",
-                        "--width", "320",
-                        "--height", "240",
-                        "--quality", "50",
-                        "--nopreview",
-                        "--immediate", "1",
-                        "--encoding", "jpg",
-                        "--timeout", "1",
-                    ],
-                    capture_output=True,
-                    timeout=5,
-                )
-
-                if r.returncode == 0 and len(r.stdout) > 100:
-                    log.info(
-                        "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
-                        len(r.stdout),
-                        (time.monotonic() - t0) * 1000.0,
-                    )
-                    return r.stdout
-
-            except Exception as e:
-                log.warning("rpicam-still failed: %s", e)
-
-        if HAS_LIBCAMERA:
-            try:
-                r = subprocess.run(
-                    [
-                        "libcamera-still",
-                        "--output", "-",
-                        "--width", "320",
-                        "--height", "240",
-                        "--quality", "50",
-                        "--nopreview",
-                        "--immediate",
-                        "--encoding", "jpg",
-                        "--timeout", "1",
-                    ],
-                    capture_output=True,
-                    timeout=5,
-                )
-
-                if r.returncode == 0 and len(r.stdout) > 100:
-                    log.info(
-                        "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
-                        len(r.stdout),
-                        (time.monotonic() - t0) * 1000.0,
-                    )
-                    return r.stdout
-
-            except Exception as e:
-                log.warning("libcamera-still failed: %s", e)
-
-        try:
-            import cv2
-
-            if self.cap is None or not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(0)
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-            # Drop one buffered frame so scene is fresh.
-            self.cap.grab()
-
-            ok, frame = self.cap.read()
-
-            if not ok:
-                return None
-
-            ok, buf = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), 50],
-            )
-
-            if not ok:
-                return None
-
-            jpeg = buf.tobytes()
-
-            log.info(
-                "📷 CAMERA CAPTURED | %d bytes | %.0f ms",
-                len(jpeg),
-                (time.monotonic() - t0) * 1000.0,
-            )
-
-            return jpeg
-
-        except Exception as e:
-            log.warning("OpenCV camera failed: %s", e)
-            return None
-
-    def close(self):
-        if self.cap:
-            try:
-                self.cap.release()
-            except Exception:
-                pass
-
-
-camera = Camera()
-
-
-# ---------------------------------------------------------------------------
-# Vision — OLLAMA ONLY
-# ---------------------------------------------------------------------------
-vision_session = None
-
-
-async def get_vision_session():
-    """Persistent aiohttp session so every see_object call does not pay a
-    fresh TLS/connect handshake."""
-    global vision_session
-
-    if aiohttp is None:
-        return None
-
-    if vision_session is None or vision_session.closed:
-        connector = aiohttp.TCPConnector(
-            family=socket.AF_INET,
-            limit=2,
-            ttl_dns_cache=300,
-        )
-
-        vision_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(
-                total=25,
-                connect=5,
-                sock_connect=5,
-                sock_read=20,
-            ),
-        )
-
-    return vision_session
-
-
-async def _ollama_vision_request(jpeg, prompt):
-    """Analyze one fresh camera JPEG through Ollama /api/generate."""
-    if not OLLAMA_VISION_MODEL:
-        return "OLLAMA_VISION_MODEL is missing."
-
-    url = OLLAMA_CLOUD_URL + "/api/generate"
-
-    payload = {
-        "model": OLLAMA_VISION_MODEL,
-        "prompt": (
-            "Describe what you see in 1-2 concise sentences. "
-            "Focus on: "
-            + (prompt or "everything important in the scene.")
-        ),
-        "images": [base64.b64encode(jpeg).decode("utf-8")],
-        "stream": False,
-    }
-
-    headers = {"Content-Type": "application/json"}
-
-    if OLLAMA_API_KEY:
-        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
-
-    s = await get_vision_session()
-
-    if s is None:
-        return "aiohttp is not installed. pip install aiohttp"
-
-    t0 = time.monotonic()
-
-    log.info(
-        "🌐 OLLAMA VISION START | model=%s | image=%d bytes | url=%s",
-        OLLAMA_VISION_MODEL,
-        len(jpeg),
-        url,
-    )
-
-    async with s.post(url, json=payload, headers=headers) as r:
-        text = await r.text()
-        elapsed = (time.monotonic() - t0) * 1000.0
-
-        log.info(
-            "🌐 OLLAMA VISION HTTP | status=%s | %.0f ms",
-            r.status,
-            elapsed,
-        )
-
-        if r.status != 200:
-            log.error(
-                "❌ OLLAMA VISION HTTP ERROR | %s | %s",
-                r.status,
-                text[:1000],
-            )
-            return f"Ollama vision error {r.status}: {text[:300]}"
-
-    try:
-        d = json.loads(text)
-    except Exception:
-        log.error("❌ OLLAMA VISION INVALID JSON | %s", text[:500])
-        return "Ollama returned an invalid vision response."
-
-    out = (d.get("response") or "").strip()
-
-    if not out:
-        log.error(
-            "❌ OLLAMA VISION EMPTY RESPONSE | %s",
-            json.dumps(d)[:1000],
-        )
-        return "Ollama returned no image analysis."
-
-    log.info("🌐 OLLAMA VISION RESULT | %s", out)
-
-    return out
-
-
-async def analyze_image_async(jpeg, prompt):
-    if not ENABLE_VISION:
-        return "Vision is disabled."
-
-    if not jpeg:
-        return "No image captured."
-
-    if not OLLAMA_VISION_MODEL:
-        log.error("❌ OLLAMA_VISION_MODEL is missing in .env")
-        return "OLLAMA_VISION_MODEL is missing."
-
-    for attempt in (1, 2):
-        try:
-            return await _ollama_vision_request(jpeg, prompt)
-
-        except asyncio.TimeoutError:
-            log.warning(
-                "⏱️ OLLAMA VISION TIMEOUT | attempt=%d/2 | model=%s",
-                attempt,
-                OLLAMA_VISION_MODEL,
-            )
-            if attempt == 2:
-                return "Image analysis timed out. Please try again."
-            await asyncio.sleep(0.15)
-
-        except Exception as e:
-            if aiohttp is not None and isinstance(e, aiohttp.ClientError):
-                log.warning(
-                    "🌐 OLLAMA VISION NETWORK ERROR | attempt=%d/2 | %s",
-                    attempt,
-                    e,
-                )
-            else:
-                log.exception("❌ OLLAMA VISION UNEXPECTED ERROR | %s", e)
-
-            if attempt == 2:
-                return f"Image analysis failed: {e}"
-
-            await asyncio.sleep(0.15)
-
-
-# ---------------------------------------------------------------------------
-# Speaker
+# Speaker (dedicated playback thread; never blocks receive loop)
 # ---------------------------------------------------------------------------
 class Speaker:
-    """Plays audio chunks in a dedicated thread.
-    is_active() = queue not empty OR within ECHO_TAIL_MS after last write."""
-
     def __init__(self):
         self._q = BoundedTimeQueue(
             maxsize=int(os.getenv("SPK_QUEUE_MAX", "160")),
             ttl_seconds=float(os.getenv("SPK_QUEUE_TTL", "5.0")),
         )
-
         self._stop = threading.Event()
         self._playing = threading.Event()
         self._last_wrote = 0.0
         self._lock = threading.Lock()
-
         self.stream = None
         self.rate = SPK_RATE
         self._need_resample = False
@@ -889,7 +540,7 @@ class Speaker:
             name="Speaker-Player",
         ).start()
 
-        log.info("🔊 Speaker ON | queue TTL enabled")
+        logger.info("🔊 Speaker ON | queue TTL enabled")
 
     def play(self, b64):
         try:
@@ -915,7 +566,6 @@ class Speaker:
     def clear(self):
         self._q.flush()
         self._playing.clear()
-
         with self._lock:
             self._last_wrote = 0.0
 
@@ -929,38 +579,31 @@ class Speaker:
                 self.stream.close()
             except Exception:
                 pass
-
             self.stream = None
 
     def _open_stream(self):
         for rate in (24000, 48000):
             try:
                 blocksize = int(rate * 0.05)
-
                 stream = sd.RawOutputStream(
                     samplerate=rate,
                     channels=1,
                     dtype="int16",
                     blocksize=blocksize,
                 )
-
                 stream.start()
-
                 self.rate = rate
                 self._need_resample = rate == 48000
-
-                log.info(
+                logger.info(
                     "🔊 Speaker stream READY | %d Hz | blocksize=%d",
                     rate,
                     blocksize,
                 )
-
                 return stream
-
             except Exception as e:
-                log.debug("Speaker rate %d failed: %s", rate, e)
+                logger.debug("Speaker rate %d failed: %s", rate, e)
 
-        log.warning("🔊 Speaker stream unavailable")
+        logger.warning("🔊 Speaker stream unavailable")
         return None
 
     def _run(self):
@@ -974,14 +617,12 @@ class Speaker:
                     time.time() - self._last_wrote > 0.40
                 ):
                     self._playing.clear()
-
                 continue
             except Exception:
                 continue
 
             if self.stream is None:
                 self.stream = self._open_stream()
-
                 if self.stream is None:
                     time.sleep(0.2)
                     continue
@@ -996,40 +637,32 @@ class Speaker:
                     continue
 
             self._playing.set()
-
             with self._lock:
                 self._last_wrote = time.time()
 
             try:
                 self.stream.write(chunk)
             except Exception as e:
-                log.warning("Stream write error: %s", e)
-
+                logger.warning("Stream write error: %s", e)
                 try:
                     self.stream.stop()
                     self.stream.close()
                 except Exception:
                     pass
-
                 self.stream = None
 
 
 # ---------------------------------------------------------------------------
-# Microphone
+# Microphone (callback capture; echo gated by speaker state)
 # ---------------------------------------------------------------------------
 class MicCapture:
-    """Captures mic via sounddevice callback.
-    Frames queued only when WALL-E is not speaking (echo gate)."""
-
     def __init__(self, loop, speaker):
         self._loop = loop
         self._speaker = speaker
-
         self._q = AsyncBoundedTimeQueue(
             maxsize=int(os.getenv("MIC_QUEUE_MAX", "80")),
             ttl_seconds=float(os.getenv("MIC_QUEUE_TTL", "1.5")),
         )
-
         self._stream = None
         self._active_rate = MIC_RATE
         self.response_in_progress = False
@@ -1071,27 +704,21 @@ class MicCapture:
                     target_samples = int(
                         len(mono) * MIC_RATE / self._active_rate
                     )
-
                     if target_samples <= 0:
                         return
-
                     xp = np.linspace(0, len(mono) - 1, len(mono))
                     x = np.linspace(0, len(mono) - 1, target_samples)
-
                     mono = np.interp(x, xp, mono).astype(np.int16)
 
                 b64 = base64.b64encode(mono.tobytes()).decode()
-
                 self._loop.call_soon_threadsafe(self._safe_put, b64)
 
             except Exception:
                 pass
 
         devices_to_try = []
-
         try:
             default_input = sd.default.device[0]
-
             if default_input is not None and default_input >= 0:
                 devices_to_try.append(default_input)
 
@@ -1099,7 +726,6 @@ class MicCapture:
                 if dev.get("max_input_channels", 0) > 0:
                     if idx not in devices_to_try:
                         devices_to_try.append(idx)
-
         except Exception:
             devices_to_try = [None]
 
@@ -1136,7 +762,6 @@ class MicCapture:
 
                 try:
                     self._active_rate = rate
-
                     self._stream = sd.InputStream(
                         device=dev_id,
                         samplerate=rate,
@@ -1145,25 +770,21 @@ class MicCapture:
                         blocksize=int(rate * MIC_CHUNK_MS / 1000.0),
                         callback=_cb,
                     )
-
                     self._stream.start()
-
-                    log.info(
+                    logger.info(
                         "🎙️ Mic ON | %s | %d Hz | %d ch | chunk=%.0fms",
                         dev_name,
                         rate,
                         channels,
                         MIC_CHUNK_MS,
                     )
-
                     return
-
                 except Exception as ex:
                     last_error = ex
                     self._stream = None
                     continue
 
-        log.error("❌ Microphone unavailable | %s", last_error)
+        logger.error("❌ Microphone unavailable | %s", last_error)
 
     def stop(self):
         if self._stream:
@@ -1172,26 +793,266 @@ class MicCapture:
                 self._stream.close()
             except Exception:
                 pass
-
             self._stream = None
 
 
 # ---------------------------------------------------------------------------
-# WALL-E tools
+# Ollama vision
 # ---------------------------------------------------------------------------
-VALID_DIRECTIONS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
+vision_session = None
 
 
-async def tool_move_robot(args):
+async def get_vision_session():
+    global vision_session
+
+    if vision_session is None or vision_session.closed:
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            limit=2,
+            ttl_dns_cache=300,
+        )
+        vision_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(
+                total=25,
+                connect=5,
+                sock_connect=5,
+                sock_read=20,
+            ),
+        )
+
+    return vision_session
+
+
+async def _ollama_vision_request(jpeg, prompt):
+    global _image_analysis_completed
+
+    if not OLLAMA_VISION_MODEL:
+        return "OLLAMA_VISION_MODEL is missing."
+
+    url = OLLAMA_CLOUD_URL + "/api/generate"
+
+    payload = {
+        "model": OLLAMA_VISION_MODEL,
+        "prompt": (
+            "Describe what you see in 1-2 concise sentences. "
+            "Focus on: "
+            + (prompt or "everything important in the scene.")
+        ),
+        "images": [base64.b64encode(jpeg).decode("utf-8")],
+        "stream": False,
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
+    s = await get_vision_session()
+    t0 = time.monotonic()
+
+    logger.info(
+        "🌐 OLLAMA VISION START | model=%s | image=%d bytes",
+        OLLAMA_VISION_MODEL,
+        len(jpeg),
+    )
+
+    async with s.post(url, json=payload, headers=headers) as r:
+        text = await r.text()
+        elapsed = (time.monotonic() - t0) * 1000.0
+
+        logger.info(
+            "🌐 OLLAMA VISION HTTP | status=%s | %.0f ms",
+            r.status,
+            elapsed,
+        )
+
+        if r.status != 200:
+            logger.error(
+                "❌ OLLAMA VISION HTTP ERROR | %s | %s",
+                r.status,
+                text[:1000],
+            )
+            return f"Ollama vision error {r.status}: {text[:300]}"
+
+    try:
+        d = json.loads(text)
+    except Exception:
+        logger.error("❌ OLLAMA VISION INVALID JSON | %s", text[:500])
+        return "Ollama returned an invalid vision response."
+
+    out = (d.get("response") or "").strip()
+
+    if not out:
+        logger.error(
+            "❌ OLLAMA VISION EMPTY RESPONSE | %s",
+            json.dumps(d)[:1000],
+        )
+        return "Ollama returned no image analysis."
+
+    logger.info("🌐 OLLAMA VISION RESULT | %s", out)
+
+    _image_analysis_completed = True
+    return out
+
+
+async def analyze_image(jpeg, prompt):
+    if not ENABLE_VISION:
+        return "Vision is disabled."
+
+    if not jpeg:
+        return "No image captured."
+
+    if not OLLAMA_VISION_MODEL:
+        logger.error("❌ OLLAMA_VISION_MODEL is missing in .env")
+        return "OLLAMA_VISION_MODEL is missing."
+
+    for attempt in (1, 2):
+        try:
+            return await _ollama_vision_request(jpeg, prompt)
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "⏱️ OLLAMA VISION TIMEOUT | attempt=%d/2 | model=%s",
+                attempt,
+                OLLAMA_VISION_MODEL,
+            )
+            if attempt == 2:
+                return "Image analysis timed out. Please try again."
+            await asyncio.sleep(0.15)
+
+        except aiohttp.ClientError as e:
+            logger.warning(
+                "🌐 OLLAMA VISION NETWORK ERROR | attempt=%d/2 | %s",
+                attempt,
+                e,
+            )
+            if attempt == 2:
+                return "Image analysis failed (Ollama network error)."
+            await asyncio.sleep(0.15)
+
+        except Exception as e:
+            logger.exception("❌ OLLAMA VISION UNEXPECTED ERROR | %s", e)
+            return f"Image analysis failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Tool response helper
+# ---------------------------------------------------------------------------
+async def send_tool_response(ws, call_id, output):
+    await ws.send(
+        dumps(
+            {
+                "toolResponse": {
+                    "functionResponses": [
+                        {
+                            "response": {"output": str(output)},
+                            "id": call_id,
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool execution
+# ---------------------------------------------------------------------------
+async def handle_see_object(args):
+    global _image_analysis_active
+
+    _image_analysis_active = True
     loop = asyncio.get_running_loop()
 
+    logger.info("📷 SEE_OBJECT | capturing fresh frame...")
+
+    jpeg = await loop.run_in_executor(camera_executor, camera.grab)
+
+    if not jpeg:
+        result = "Failed to capture a photo from WALL-E's camera."
+        logger.error("🛠️ TOOL RESULT | see_object | %s", result)
+        return result
+
+    if ENABLE_ESP32_IMAGE:
+        try:
+            await loop.run_in_executor(
+                uart_executor,
+                send_uart_command,
+                "IMG:" + base64.b64encode(jpeg).decode(),
+            )
+        except Exception as e:
+            logger.warning("ESP32 image thumbnail failed: %s", e)
+
+    result = await analyze_image(
+        jpeg,
+        args.get("prompt", "Describe what you see."),
+    )
+
+    logger.info("🛠️ TOOL RESULT | see_object | %s", result)
+
+    try:
+        await asyncio.to_thread(
+            save_message,
+            "tool",
+            str(result),
+            SESSION_ID,
+            "see_object",
+            json.dumps(args, ensure_ascii=False),
+            str(result),
+        )
+    except Exception as e:
+        logger.warning("💾 MEMORY SAVE VISION FAILED | %s", e)
+
+    return result
+
+
+async def run_tool(name, args):
+    log_tool(name, args)
+
+    if name == "see_object":
+        return await handle_see_object(args)
+
+    func = TOOL_MAP.get(name)
+
+    if not func:
+        result = f"Unknown tool '{name}'"
+        logger.error("🛠️ TOOL RESULT | %s | %s", name, result)
+        return result
+
+    try:
+        if inspect.iscoroutinefunction(func):
+            result = await func(**args)
+        else:
+            result = await asyncio.to_thread(func, **args)
+
+        logger.info("🛠️ TOOL RESULT | %s | %s", name, result)
+
+        try:
+            await asyncio.to_thread(
+                save_message,
+                "tool",
+                str(result),
+                SESSION_ID,
+                name,
+                json.dumps(args, ensure_ascii=False),
+                str(result),
+            )
+        except Exception as e:
+            logger.warning("💾 MEMORY SAVE TOOL FAILED | %s", e)
+
+        return result
+
+    except Exception as e:
+        logger.exception("❌ TOOL ERROR | %s | %s", name, e)
+        return f"Error executing tool: {e}"
+
+
+async def handle_move(loop, args):
+    """Fast path for movement: straight to UART via tools.py."""
     d = str(args.get("direction", "STOP")).upper().strip()
 
-    if d not in VALID_DIRECTIONS:
-        return (
-            f"Invalid direction '{d}'. "
-            "Use FORWARD, BACKWARD, LEFT, RIGHT, STOP."
-        )
+    if d not in {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}:
+        return f"Invalid direction '{d}'."
 
     t0 = time.monotonic()
 
@@ -1208,55 +1069,32 @@ async def tool_move_robot(args):
     else:
         result = "ESP32 UART unavailable."
 
-    log.info(
+    logger.info(
         "🚚 MOVE COMPLETE | %s | %.1f ms | result=%s",
         d,
         elapsed,
         result,
     )
 
-    return result
-
-
-async def tool_see_object(args):
-    if not ENABLE_VISION:
-        return "Vision is disabled."
-
-    loop = asyncio.get_running_loop()
-
-    prompt = args.get("prompt", "Describe what you see.")
-
-    log.info("📷 SEE_OBJECT | capturing fresh frame...")
-
-    jpeg = await loop.run_in_executor(
-        camera_executor,
-        camera.grab,
-    )
-
-    if not jpeg:
-        return "Failed to capture a photo from WALL-E's camera."
-
-    if ENABLE_ESP32_IMAGE:
-        try:
-            uart_executor.submit(
-                send_uart_command,
-                "IMG:" + base64.b64encode(jpeg).decode(),
-            )
-        except Exception as e:
-            log.warning("ESP32 image thumbnail failed: %s", e)
-
-    result = await analyze_image_async(jpeg, prompt)
-
-    log.info("📷 SEE_OBJECT RESULT | %s", result)
+    try:
+        await asyncio.to_thread(
+            save_message,
+            "tool",
+            str(result),
+            SESSION_ID,
+            "move_robot",
+            json.dumps(args, ensure_ascii=False),
+            str(result),
+        )
+    except Exception as e:
+        logger.warning("💾 MEMORY SAVE MOVE FAILED | %s", e)
 
     return result
 
 
-def tool_get_time_info():
-    n = datetime.now()
-    return f"Time: {n:%I:%M %p}, Date: {n:%d %B %Y} ({n:%A})."
-
-
+# ---------------------------------------------------------------------------
+# Function declarations for Gemini
+# ---------------------------------------------------------------------------
 TOOLS = [
     {
         "functionDeclarations": [
@@ -1287,8 +1125,7 @@ TOOLS = [
                 "name": "see_object",
                 "description": (
                     "Captures a fresh camera frame and describes what "
-                    "WALL-E sees. Use when user asks what you can see "
-                    "or to look at something."
+                    "WALL-E sees. Use when user asks what you can see."
                 ),
                 "parameters": {
                     "type": "OBJECT",
@@ -1301,11 +1138,34 @@ TOOLS = [
                 },
             },
             {
-                "name": "get_time_info",
-                "description": "Gets current local time and date.",
+                "name": "get_weather",
+                "description": "Gets current weather.",
                 "parameters": {
                     "type": "OBJECT",
-                    "properties": {},
+                    "properties": {"city": {"type": "STRING"}},
+                },
+            },
+            {
+                "name": "get_time_info",
+                "description": "Gets current local time and date.",
+                "parameters": {"type": "OBJECT", "properties": {}},
+            },
+            {
+                "name": "search_web",
+                "description": "Searches the web for a factual query.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {"query": {"type": "STRING"}},
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "remember_fact",
+                "description": "Stores an important fact in long-term memory.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {"fact": {"type": "STRING"}},
+                    "required": ["fact"],
                 },
             },
         ]
@@ -1314,40 +1174,84 @@ TOOLS = [
 
 
 # ---------------------------------------------------------------------------
-# Prompt
+# Instruction (prompt + memory context)
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = f"""
-You are {AGENT_NAME}, a cute mini AI companion robot.
-You were built by Aashutosh Sir.
-The user's name is {USER_NAME}.
+def build_instruction():
+    memory_text = ""
 
-Rules:
-- Speak naturally in Hindi/Hinglish unless the user speaks another language.
-- Keep replies very short: 1-3 sentences.
-- Be friendly, energetic, and helpful.
-- Use move_robot tool immediately for movement commands.
-- Use see_object tool when asked what you can see.
-- Do not mention tools, JSON, function names, or technical internals.
-- Do not output markdown.
-""".strip()
+    # remember_fact writes to memory.json via tools._remember_fact.
+    memory_json = os.path.join(BASE, "memory.json")
+    try:
+        if os.path.exists(memory_json):
+            with open(memory_json, encoding="utf-8") as f:
+                m = json.load(f)
+            if isinstance(m, list):
+                facts = [
+                    f"- {x.get('fact') or x.get('content')}"
+                    for x in m[-20:]
+                    if isinstance(x, dict)
+                    and (x.get("fact") or x.get("content"))
+                ]
+                if facts:
+                    memory_text += "\n\nPAST MEMORIES:\n" + "\n".join(facts)
+    except Exception:
+        pass
+
+    recent = format_recent_context(limit=MEMORY_TURNS, session_id=None)
+    if recent:
+        memory_text += "\n\n" + recent
+
+    return AGENT_INSTRUCTION + memory_text
 
 
 # ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
 async def run_session():
+    global is_ai_speaking
+    global _image_analysis_active, _image_analysis_completed
+
+    if not API_KEY:
+        logger.error("❌ GOOGLE_API_KEY missing in .env")
+        return
+
     loop = asyncio.get_running_loop()
 
     speaker = Speaker()
     mic = MicCapture(loop, speaker)
 
-    # Open UART early.
+    instruction = build_instruction()
+
+    setup = {
+        "setup": {
+            "model": MODEL,
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
+            "generation_config": {
+                "response_modalities": ["AUDIO"],
+                "thinking_config": {"thinking_budget": 0},
+                "speech_config": {
+                    "voice_config": {
+                        "prebuilt_voice_config": {"voice_name": VOICE_NAME}
+                    }
+                },
+            },
+            "realtimeInputConfig": {
+                "automaticActivityDetection": {
+                    "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
+                    "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
+                    "prefixPaddingMs": 80,
+                    "silenceDurationMs": 280,
+                }
+            },
+            "system_instruction": {"parts": [{"text": instruction}]},
+            "tools": TOOLS,
+        }
+    }
+
+    # Open UART early so first command is fast.
     try:
-        await loop.run_in_executor(
-            uart_executor,
-            send_uart_command,
-            "BOOT",
-        )
+        await loop.run_in_executor(uart_executor, send_uart_command, "BOOT")
     except Exception:
         pass
 
@@ -1360,9 +1264,9 @@ async def run_session():
         send_lock = asyncio.Lock()
 
         st = dict(
-            greeting=bool(GREETING_TRIGGER),
             user_buf="",
             asst_buf="",
+            greeted=not ENABLE_GREETING,
         )
 
         async def safe_send(msg):
@@ -1370,7 +1274,7 @@ async def run_session():
                 async with send_lock:
                     await ws.send(msg)
             except Exception as e:
-                log.warning("WS send failed: %s", e)
+                logger.warning("WS send failed: %s", e)
 
         async def inject(text):
             await safe_send(
@@ -1378,131 +1282,58 @@ async def run_session():
                     {
                         "clientContent": {
                             "turns": [
-                                {
-                                    "role": "user",
-                                    "parts": [{"text": text}],
-                                }
+                                {"role": "user", "parts": [{"text": text}]}
                             ],
                             "turnComplete": True,
                         }
                     }
                 )
             )
-
-            log.info("💉 %s", text[:90])
+            logger.info("💉 %s", text[:90])
 
         async def audio_sender():
             was_active = False
 
             while True:
                 try:
-                    if st["greeting"]:
-                        mic.clear_queue()
-                        await asyncio.sleep(0.10)
-                        continue
-
                     active = speaker.is_active() or mic.response_in_progress
 
                     if active and not ALLOW_BARGE_IN:
                         if not was_active:
-                            log.info("🔊 %s speaking: holding mic", AGENT_NAME)
+                            logger.info("🔊 %s speaking: holding mic", AGENT_NAME)
                             was_active = True
-
                         mic.clear_queue()
                         await asyncio.sleep(0.05)
                         continue
 
                     if not active and was_active:
-                        log.info("🎤 Listening for voice input...")
+                        logger.info("🎤 Listening for voice input...")
                         mic.clear_queue()
                         was_active = False
 
                     b64 = await mic.queue.get()
 
-                    if REALTIME_INPUT_FIELD == "audio":
-                        payload = {
-                            "realtimeInput": {
-                                "audio": {
+                    payload = {
+                        "realtimeInput": {
+                            "mediaChunks": [
+                                {
                                     "mimeType": "audio/pcm;rate=16000",
                                     "data": b64,
                                 }
-                            }
+                            ]
                         }
-                    else:
-                        payload = {
-                            "realtimeInput": {
-                                "mediaChunks": [
-                                    {
-                                        "mimeType": "audio/pcm;rate=16000",
-                                        "data": b64,
-                                    }
-                                ]
-                            }
-                        }
+                    }
 
                     await safe_send(dumps(payload))
 
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    log.error("audio_sender error: %s", e)
+                    logger.error("audio_sender error: %s", e)
                     break
 
-        async def handle_tool_calls(tc):
-            calls = tc.get("functionCalls", [])
-
-            if not calls:
-                return
-
-            has_move = any(c.get("name") == "move_robot" for c in calls)
-
-            if not has_move:
-                eye("THINK")
-
-            for call in calls:
-                name = call.get("name", "")
-                args = call.get("args") or {}
-                call_id = call.get("id", "")
-
-                log.info("🔧 Tool: %s | args=%s", name, args)
-
-                if name == "move_robot":
-                    result = await tool_move_robot(args)
-
-                elif name == "see_object":
-                    result = await tool_see_object(args)
-
-                elif name == "get_time_info":
-                    result = await loop.run_in_executor(
-                        tool_executor,
-                        tool_get_time_info,
-                    )
-
-                else:
-                    result = f"Unknown tool '{name}'."
-
-                log.info("✅ [%s] %s", name, result)
-
-                await safe_send(
-                    dumps(
-                        {
-                            "toolResponse": {
-                                "functionResponses": [
-                                    {
-                                        "response": {"output": str(result)},
-                                        "id": call_id,
-                                    }
-                                ]
-                            }
-                        }
-                    )
-                )
-
-            if not speaker.is_active():
-                eye("EYES_NORMAL")
-
         try:
-            log.info("🔌 Connecting to Gemini Live...")
+            logger.info("🔌 Connecting to Gemini Live...")
 
             async with websockets.connect(
                 WS_URL,
@@ -1512,39 +1343,8 @@ async def run_session():
                 open_timeout=15,
                 compression=None,
             ) as ws:
-                setup = {
-                    "setup": {
-                        "model": MODEL,
-                        "generation_config": {
-                            "response_modalities": ["AUDIO"],
-                            "thinking_config": {"thinking_budget": 0},
-                            "speech_config": {
-                                "voice_config": {
-                                    "prebuilt_voice_config": {
-                                        "voice_name": VOICE_NAME
-                                    }
-                                }
-                            },
-                        },
-                        "realtimeInputConfig": {
-                            "automaticActivityDetection": {
-                                "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
-                                "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
-                                "prefixPaddingMs": 80,
-                                "silenceDurationMs": 280,
-                            }
-                        },
-                        "inputAudioTranscription": {},
-                        "outputAudioTranscription": {},
-                        "system_instruction": {
-                            "parts": [{"text": SYSTEM_PROMPT}]
-                        },
-                        "tools": TOOLS,
-                    }
-                }
-
                 await ws.send(dumps(setup))
-                log.info("📤 Setup sent")
+                logger.info("📤 Setup sent")
 
                 async for raw in ws:
                     try:
@@ -1553,14 +1353,14 @@ async def run_session():
                         continue
 
                     if "error" in data:
-                        log.error(
+                        logger.error(
                             "API error: %s",
                             data.get("error", {}).get("message", "?"),
                         )
                         continue
 
                     if "setupComplete" in data:
-                        log.info("✅ Ready!")
+                        logger.info("✅ Ready!")
 
                         speaker.clear()
                         mic.response_in_progress = False
@@ -1568,12 +1368,13 @@ async def run_session():
 
                         audio_task = asyncio.create_task(audio_sender())
 
-                        if GREETING_TRIGGER:
-                            st["greeting"] = True
-                            await inject(GREETING_TRIGGER)
+                        if not st["greeted"]:
+                            st["greeted"] = True
+                            await inject(
+                                "Greet the user briefly and ask for orders."
+                            )
                         else:
-                            st["greeting"] = False
-                            log.info("🎤 Bolo boss!")
+                            logger.info("🎤 Bolo boss!")
 
                         eye("EYES_NORMAL")
                         continue
@@ -1582,22 +1383,17 @@ async def run_session():
 
                     # Interruption
                     if sc.get("interrupted"):
-                        log.info(
-                            "⚡ [Interruption] User interrupted %s", AGENT_NAME
-                        )
+                        logger.info("⚡ [Interruption] User interrupted %s", AGENT_NAME)
 
                         st["user_buf"] = ""
                         st["asst_buf"] = ""
-
                         mic.response_in_progress = False
                         speaker.clear()
-
                         eye("EYES_NORMAL")
                         continue
 
                     # User transcript
                     u = (sc.get("inputTranscription") or {}).get("text", "")
-
                     if u:
                         if not st["user_buf"]:
                             eye("LISTEN")
@@ -1615,14 +1411,12 @@ async def run_session():
 
                     # Assistant transcript
                     a = (sc.get("outputTranscription") or {}).get("text", "")
-
                     if a:
                         st["asst_buf"] = merge_transcripts(st["asst_buf"], a)
 
                     # Audio playback
                     for part in (sc.get("modelTurn") or {}).get("parts", []):
                         b64 = (part.get("inlineData") or {}).get("data", "")
-
                         if not b64:
                             continue
 
@@ -1633,10 +1427,8 @@ async def run_session():
 
                         if len(audio_bytes) >= 100:
                             mic.response_in_progress = True
-
                             if not speaker.is_active():
                                 eye("EYES_TALKING")
-
                             speaker.play(b64)
 
                     # Turn complete
@@ -1649,27 +1441,39 @@ async def run_session():
                         ai_text = st["asst_buf"].strip()
 
                         if user_text:
-                            log.info("🎙️ User: %s", user_text)
-
+                            log_user(user_text)
                         if ai_text:
                             clean_asst = re.sub(
-                                r"\[TOOL:[^\]]*\]",
-                                "",
-                                ai_text,
+                                r"\[TOOL:[^\]]*\]", "", ai_text
                             ).strip()
+                            log_ai(clean_asst)
 
-                            log.info("🤖 %s: %s", AGENT_NAME, clean_asst)
+                        # Persist completed turn.
+                        if user_text:
+                            try:
+                                await asyncio.to_thread(
+                                    save_message, "user", user_text, SESSION_ID
+                                )
+                            except Exception as e:
+                                logger.warning("💾 SAVE USER FAILED | %s", e)
 
-                        if ENABLE_MEMORY and user_text and ai_text:
-                            threading.Thread(
-                                target=save_memory,
-                                args=(user_text, ai_text),
-                                daemon=True,
-                            ).start()
+                        if ai_text:
+                            try:
+                                await asyncio.to_thread(
+                                    save_message, "assistant", ai_text, SESSION_ID
+                                )
+                            except Exception as e:
+                                logger.warning("💾 SAVE AI FAILED | %s", e)
 
-                        if st["greeting"]:
-                            st["greeting"] = False
-                            log.info("🎤 Bolo boss!")
+                        # Clear ESP32 image only after successful vision turn.
+                        if _image_analysis_active and _image_analysis_completed:
+                            logger.info("🧹 IMAGE ANALYSIS COMPLETE | IMG_CLEAR")
+                            await loop.run_in_executor(
+                                uart_executor, send_uart_command, "IMG_CLEAR"
+                            )
+
+                        _image_analysis_active = False
+                        _image_analysis_completed = False
 
                         st["user_buf"] = ""
                         st["asst_buf"] = ""
@@ -1679,17 +1483,44 @@ async def run_session():
 
                     # Native tool calls
                     tc = data.get("toolCall")
-
                     if tc:
                         print()
-                        await handle_tool_calls(tc)
+
+                        calls = tc.get("functionCalls", [])
+
+                        moves = [
+                            c for c in calls if c.get("name") == "move_robot"
+                        ]
+                        others = [
+                            c for c in calls if c.get("name") != "move_robot"
+                        ]
+
+                        # Movement: absolute shortest path to UART.
+                        for c in moves:
+                            args = c.get("args") or {}
+                            result = await handle_move(loop, args)
+                            await send_tool_response(
+                                ws, c.get("id", ""), result
+                            )
+
+                        # Other tools.
+                        if others:
+                            eye("THINK")
+                            for c in others:
+                                result = await run_tool(
+                                    c.get("name", ""), c.get("args") or {}
+                                )
+                                await send_tool_response(
+                                    ws, c.get("id", ""), result
+                                )
+                            eye("EYES_NORMAL")
 
         except websockets.exceptions.ConnectionClosed as e:
-            log.warning("🔌 WS connection closed: %s", e)
+            logger.warning("🔌 WS connection closed: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.error("🔌 Session error: %s", e, exc_info=True)
+            logger.error("🔌 Session error: %s", e, exc_info=True)
         finally:
             if audio_task:
                 try:
@@ -1702,14 +1533,19 @@ async def run_session():
             except Exception:
                 pass
 
-            log.info("🔌 Cleanup complete.")
+            logger.info("🔌 Cleanup complete.")
 
-        log.info("🔄 Reconnecting in 3 seconds...")
+        is_reconnect = True
+        logger.info("🔄 Reconnecting in 3 seconds...")
         await asyncio.sleep(3)
 
 
+# Alias so both `run` and `run_session` work.
+run = run_session
+
+
 # ---------------------------------------------------------------------------
-# Entry
+# Entry (direct run)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if not API_KEY:
@@ -1724,7 +1560,7 @@ if __name__ == "__main__":
 ║   Mic chunk    : {MIC_CHUNK_MS:.0f} ms
 ║   Speaker queue: TTL bounded
 ║   Vision       : Ollama ({OLLAMA_VISION_MODEL or 'NOT_SET'})
-║   Memory       : {'ON' if ENABLE_MEMORY else 'OFF'}
+║   UART         : tools.py canonical layer
 ║   Ctrl+C       : stop
 ╚══════════════════════════════════════════════════════╝
 """
@@ -1736,10 +1572,14 @@ if __name__ == "__main__":
         print("\n[Stop] Bye!")
     finally:
         try:
+            # Stop motors, then close UART.
+            send_uart_command("STOP")
+        except Exception:
+            pass
+        try:
             close_uart()
         except Exception:
             pass
-
         try:
             camera.close()
         except Exception:
