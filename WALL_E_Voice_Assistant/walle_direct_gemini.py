@@ -150,7 +150,13 @@ ENABLE_GREETING = _env_bool("ENABLE_GREETING", "1")
 
 VOICE_NAME = os.getenv("VOICE_NAME", "Puck").strip()
 
-MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "30"))
+MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "8"))
+
+# Audio AGC and Distance Gain settings
+DIGITAL_GAIN = 2.5         # Boost distant voice
+SILENCE_THRESHOLD = 140    # Filters idle room hum so Gemini VAD stays snappy
+HOLD_FRAMES = 6            # Keep sending 6 chunks (~380ms) after speech stops for clean word endings
+
 SESSION_ID = os.getenv("WALLE_SESSION_ID", "") or time.strftime("%Y%m%d-%H%M%S")
 
 # Ollama vision (ONLY vision backend).
@@ -520,6 +526,16 @@ class AsyncBoundedTimeQueue:
 # ---------------------------------------------------------------------------
 # Speaker (dedicated playback thread; never blocks receive loop)
 # ---------------------------------------------------------------------------
+
+def _resample_24k_to_48k_stereo(raw_pcm_bytes: bytes) -> bytes:
+    """Converts 24kHz Mono PCM from Gemini to 48kHz Stereo for Bluetooth A2DP."""
+    pcm = np.frombuffer(raw_pcm_bytes, dtype=np.int16)
+    if len(pcm) == 0:
+        return b""
+    pcm_48k = np.repeat(pcm, 2)
+    stereo_pcm = np.column_stack((pcm_48k, pcm_48k)).ravel()
+    return stereo_pcm.tobytes()
+
 class Speaker:
     def __init__(self):
         self._q = BoundedTimeQueue(
@@ -582,29 +598,35 @@ class Speaker:
             self.stream = None
 
     def _open_stream(self):
-        for rate in (24000, 48000):
+        """Opens speaker at 48kHz Stereo via PulseAudio/Default so Bluetooth never drops."""
+        for dev in ("pulse", None):
             try:
-                blocksize = int(rate * 0.05)
                 stream = sd.RawOutputStream(
-                    samplerate=rate,
-                    channels=1,
+                    samplerate=48000,
+                    channels=2,
                     dtype="int16",
-                    blocksize=blocksize,
+                    blocksize=2048,
+                    device=dev,
                 )
                 stream.start()
-                self.rate = rate
-                self._need_resample = rate == 48000
-                logger.info(
-                    "🔊 Speaker stream READY | %d Hz | blocksize=%d",
-                    rate,
-                    blocksize,
-                )
+                self.rate = 48000
+                logger.info("Speaker opened at 48000Hz Stereo (device=%s)", dev)
                 return stream
             except Exception as e:
-                logger.debug("Speaker rate %d failed: %s", rate, e)
-
-        logger.warning("🔊 Speaker stream unavailable")
-        return None
+                logger.debug("Speaker open attempt (%s) failed: %s", dev, e)
+        try:
+            stream = sd.RawOutputStream(
+                samplerate=48000,
+                channels=2,
+                dtype="int16",
+                blocksize=2048,
+            )
+            stream.start()
+            self.rate = 48000
+            return stream
+        except Exception as e:
+            logger.warning("Speaker stream unavailable: %s", e)
+            return None
 
     def _run(self):
         self.stream = self._open_stream()
@@ -627,14 +649,10 @@ class Speaker:
                     time.sleep(0.2)
                     continue
 
-            if self._need_resample:
-                try:
-                    chunk = np.repeat(
-                        np.frombuffer(chunk, dtype=np.int16),
-                        2,
-                    ).tobytes()
-                except Exception:
-                    continue
+            try:
+                chunk = _resample_24k_to_48k_stereo(chunk)
+            except Exception:
+                continue
 
             self._playing.set()
             with self._lock:
@@ -1101,24 +1119,48 @@ TOOLS = [
             {
                 "name": "move_robot",
                 "description": (
-                    "Immediately controls WALL-E movement. "
-                    "Use for forward, backward, left, right, stop."
+                    "Controls WALL-E physical movement with autonomous visual distance and speed estimation. "
+                    "AI decides direction, duration_ms (150-3500ms based on obstacle distance), speed (130-255), "
+                    "and eye emotion (HAPPY, SAD, ANGRY, THINK, IDLE)."
                 ),
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "direction": {
                             "type": "STRING",
-                            "enum": [
-                                "FORWARD",
-                                "BACKWARD",
-                                "LEFT",
-                                "RIGHT",
-                                "STOP",
-                            ],
-                        }
+                            "enum": ["FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"],
+                            "description": "Movement direction",
+                        },
+                        "duration_ms": {
+                            "type": "INTEGER",
+                            "description": "Duration in milliseconds (200-3500ms based on visual distance estimation)",
+                        },
+                        "speed": {
+                            "type": "INTEGER",
+                            "description": "PWM motor speed from 130 (slow) to 255 (fast)",
+                        },
+                        "emotion": {
+                            "type": "STRING",
+                            "enum": ["HAPPY", "SAD", "ANGRY", "THINK", "IDLE"],
+                            "description": "Facial eye expression to display while moving",
+                        },
                     },
                     "required": ["direction"],
+                },
+            },
+            {
+                "name": "set_eye_emotion",
+                "description": "Changes WALL-E animated OLED eye expression to reflect current emotion.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "emotion": {
+                            "type": "STRING",
+                            "enum": ["HAPPY", "SAD", "ANGRY", "THINK", "IDLE"],
+                            "description": "Eye expression to display",
+                        }
+                    },
+                    "required": ["emotion"],
                 },
             },
             {
@@ -1227,7 +1269,11 @@ async def run_session():
             "model": MODEL,
             "inputAudioTranscription": {},
             "outputAudioTranscription": {},
-            "generation_config": {
+            "contextWindowCompression": {
+            "slidingWindow": {},
+            "triggerTokens": 10000,
+        },
+        "generation_config": {
                 "response_modalities": ["AUDIO"],
                 "thinking_config": {"thinking_budget": 0},
                 "speech_config": {
@@ -1291,7 +1337,88 @@ async def run_session():
             )
             logger.info("💉 %s", text[:90])
 
+
+        # ---------------------------------------------------------------------------
+        # Continuous Autonomous Vision Stream (Every 2.5s)
+        # ---------------------------------------------------------------------------
+        async def live_vision_loop():
+            """Continuously streams a lightweight JPEG frame every 2.5s to Gemini Live."""
+            logger.info("👁️ Continuous Autonomous Vision Stream started...")
+            while True:
+                try:
+                    await asyncio.sleep(2.5)
+                    if speaker.is_active() or mic.response_in_progress:
+                        continue
+
+                    jpeg = await loop.run_in_executor(None, camera.capture_jpeg)
+                    if not jpeg:
+                        continue
+
+                    b64_img = base64.b64encode(jpeg).decode("utf-8")
+                    payload = {
+                        "realtimeInput": {
+                            "mediaChunks": [
+                                {
+                                    "mimeType": "image/jpeg",
+                                    "data": b64_img,
+                                }
+                            ]
+                        }
+                    }
+                    await safe_send(dumps(payload))
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug("live_vision_loop: %s", e)
+                    await asyncio.sleep(1.0)
+
+        # ---------------------------------------------------------------------------
+        # Autonomous Free-Will / Idle Thought Loop (Triggers interaction after 40s silence)
+        # ---------------------------------------------------------------------------
+        AUTONOMOUS_IDLE_SECONDS = 40
+
+        async def autonomous_mind_loop():
+            """Triggers WALL-E to think, joke, or explore on its own when idle."""
+            global _last_user_audio_ts
+            logger.info("🧠 Autonomous Free-Will Engine active...")
+
+            while True:
+                try:
+                    await asyncio.sleep(5.0)
+                    if speaker.is_active() or mic.response_in_progress:
+                        _last_user_audio_ts = time.monotonic()
+                        continue
+
+                    idle_time = time.monotonic() - _last_user_audio_ts
+                    if idle_time >= AUTONOMOUS_IDLE_SECONDS:
+                        _last_user_audio_ts = time.monotonic()
+                        logger.info("✨ [Autonomous Mind] WALL-E decided to initiate interaction!")
+
+                        thought_msg = {
+                            "clientContent": {
+                                "turns": [{
+                                    "role": "user",
+                                    "parts": [{
+                                        "text": (
+                                            "[AUTONOMOUS_THOUGHT]: The room has been quiet for 40 seconds. "
+                                            "Look at your live camera feed right now. Decide on your own: "
+                                            "1) Comment wittily on what the user is doing or crack a short spontaneous joke in Hinglish, OR "
+                                            "2) Change your eye emotion and make a small curious turn/movement if the path is clear."
+                                        )
+                                    }]
+                                }],
+                                "turnComplete": True
+                            }
+                        }
+                        await safe_send(dumps(thought_msg))
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug("autonomous_mind_loop: %s", e)
+                    await asyncio.sleep(5.0)
+
         async def audio_sender():
+            global _last_user_audio_ts
             was_active = False
 
             while True:
@@ -1367,6 +1494,8 @@ async def run_session():
                         mic.start()
 
                         audio_task = asyncio.create_task(audio_sender())
+                        vision_task = asyncio.create_task(live_vision_loop())
+                        mind_task = asyncio.create_task(autonomous_mind_loop())
 
                         if not st["greeted"]:
                             st["greeted"] = True

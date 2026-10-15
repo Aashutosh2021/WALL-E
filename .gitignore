@@ -26,6 +26,7 @@ walle_memory/
 # Scratch & test scripts
 test.py
 extra/
+graphify-out/
 
 # Documents & temporary files
 Repository File Structure & Cleanup Guide.md

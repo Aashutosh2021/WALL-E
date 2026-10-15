@@ -23,217 +23,128 @@ logger = logging.getLogger("WALLE")
 
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-SERIAL_PORT = os.getenv("SERIAL_PORT", os.getenv("ESP32_PORT", "/dev/serial0"))
-# NOTE: default was 9600 — the ESP32 UART firmware (WALL_E_ESP32_UART.ino)
-# hardcodes Serial2.begin(115200, ...). A 9600 default here means a fresh
-# .env following the README's own example (BAUD_RATE=9600) never talks to
-# the board at all: every write silently "succeeds" (serial.write doesn't
-# know the other side can't decode it) but no ACK ever comes back. Default
-# now matches the firmware. Still fully overridable via BAUD_RATE/.env if
-# a given board really is wired for 9600.
-BAUD = int(os.getenv("BAUD_RATE", os.getenv("ESP32_BAUD", "115200")))
-ENABLE_ESP32_IMAGE = os.getenv("ENABLE_ESP32_IMAGE", "0").lower() in {
-    "1", "true", "yes", "on"
-}
+_ESP32_PORT = os.getenv("ESP32_PORT", os.getenv("SERIAL_PORT", "/dev/serial0"))
+_ESP32_BAUD = int(os.getenv("ESP32_BAUD", os.getenv("BAUD_RATE", "9600")))
 
-_ser = None
-_lock = threading.RLock()
-_reader_thread = None
-_reader_stop = None
-
-# BUG FIXED: _open_serial_locked() used to retry `serial.Serial(...)` on
-# EVERY single call whenever the port wasn't open — and eye() fires on
-# basically every turn boundary (talking/listening/normal), so a genuinely
-# absent/busy port meant a fresh failing open attempt (with its own
-# exception, traceback-free log line, and — on POSIX — nothing, but this
-# still burns an asyncio.to_thread() executor slot) right at the same
-# moments the audio worker most needs free scheduling headroom. A short
-# cooldown after a failed open turns "retry every single call forever"
-# into "retry a few times a minute", with zero change to behavior once
-# the port actually is available.
-_OPEN_RETRY_COOLDOWN_S = 3.0
-_last_open_attempt = 0.0
+_serial_lock = threading.Lock()
+_esp32_serial = None
 
 
-def _open_serial_locked():
-    """Open the USB serial port once and keep it open."""
-    global _ser, _reader_thread, _reader_stop, _last_open_attempt
-
-    if _ser is not None:
-        try:
-            if _ser.is_open:
-                return _ser
-        except Exception:
-            _ser = None
-
-    now = time.monotonic()
-    if now - _last_open_attempt < _OPEN_RETRY_COOLDOWN_S:
-        return None
-    _last_open_attempt = now
-
+def _get_serial():
+    global _esp32_serial
+    if _esp32_serial is not None and _esp32_serial.is_open:
+        return _esp32_serial
     try:
         import serial
-
-        # BUG FIXED: `exclusive=False` is a POSIX-only pyserial option.
-        # On Windows, passing it at all (even False) raises
-        # ValueError("win32 only supports exclusive access (not: False)")
-        # from pyserial's win32 backend — every single UART command
-        # failed with that exact error on Windows dev machines, which is
-        # not a "no port" problem, it's this parameter. Only pass it on
-        # POSIX, where it's meaningful (lets other processes share the
-        # port for debugging).
-        serial_kwargs = dict(
-            port=SERIAL_PORT,
-            baudrate=BAUD,
-            timeout=0.05,
-            write_timeout=0.05,
+        _esp32_serial = serial.Serial(
+            port=_ESP32_PORT,
+            baudrate=_ESP32_BAUD,
+            timeout=0.15,       # Fast 150ms read timeout (never hangs Python)
+            write_timeout=0.2,
         )
-        if sys.platform != "win32":
-            serial_kwargs["exclusive"] = False
-
-        _ser = serial.Serial(**serial_kwargs)
-
-        # Opening USB serial can reset ESP32. Give firmware time to boot.
-        time.sleep(0.35)
-
-        try:
-            _ser.reset_input_buffer()
-        except Exception:
-            pass
-
-        logger.info("🔌 ESP32 UART CONNECTED | port=%s | baud=%d", SERIAL_PORT, BAUD)
-
-        # Start ACK/log reader once.
-        if _reader_thread is None or not _reader_thread.is_alive():
-            _reader_stop = threading.Event()
-            _reader_thread = threading.Thread(
-                target=_serial_reader,
-                args=(_reader_stop,),
-                daemon=True,
-                name="ESP32-UART-Reader",
-            )
-            _reader_thread.start()
-
-        return _ser
-
+        return _esp32_serial
     except Exception as e:
-        logger.error("❌ ESP32 UART OPEN FAILED | port=%s | error=%s", SERIAL_PORT, e)
-        _ser = None
+        logger.warning("ESP32 Serial open failed on %s: %s", _ESP32_PORT, e)
         return None
 
 
-def _serial_reader(stop_event):
-    """Read ESP32 ACK/debug lines asynchronously so motor commands stay fast."""
-    global _ser
-
-    while not stop_event.is_set():
+def send_esp32_command(command: str, wait_ack: bool = False) -> str:
+    """Thread-safe serial sender. Eye commands use wait_ack=False for zero latency."""
+    with _serial_lock:
+        ser = _get_serial()
+        if not ser:
+            return "SERIAL_DISCONNECTED"
         try:
-            ser = _ser
-            if ser is None or not ser.is_open:
-                time.sleep(0.1)
-                continue
-
-            raw = ser.readline()
-            if not raw:
-                continue
-
-            text = raw.decode("utf-8", errors="replace").strip()
-            if text:
-                # ESP32 firmware sends ACK_<command> and may also send debug text.
-                if text.startswith("ACK_"):
-                    logger.info("📥 ESP32 ACK | %s", text)
-                else:
-                    logger.info("📥 ESP32 LOG | %s", text)
-
-        except Exception as e:
-            if not stop_event.is_set():
-                logger.debug("UART reader: %s", e)
-            time.sleep(0.1)
-
-
-def send_uart_command(command: str) -> bool:
-    """Send one newline-delimited command to ESP32."""
-    global _ser
-
-    cmd = (command or "").strip()
-    if not cmd:
-        return False
-
-    if cmd.startswith("IMG:") and not ENABLE_ESP32_IMAGE:
-        logger.debug("UART image skipped because ENABLE_ESP32_IMAGE=0")
-        return False
-
-    payload = (cmd + "\n").encode("utf-8")
-
-    with _lock:
-        ser = _open_serial_locked()
-        if ser is None:
-            return False
-
-        try:
-            t0 = time.monotonic()
+            ser.reset_input_buffer()  # Clear stale ACKs
+            payload = f"{command.strip()}\n".encode("utf-8")
             ser.write(payload)
             ser.flush()
-            elapsed = (time.monotonic() - t0) * 1000
 
-            display_cmd = "IMG:<base64>" if cmd.startswith("IMG:") else cmd
-            logger.info("📤 ESP32 TX | %s | %.1f ms", display_cmd, elapsed)
-            return True
-
+            if wait_ack:
+                ack = ser.readline().decode("utf-8", errors="ignore").strip()
+                return ack or "NO_ACK"
+            return "SENT"
         except Exception as e:
-            # BUG FIXED: this assignment used to target a function-local
-            # `_ser` (no `global` declaration), so it never actually
-            # updated the module-level handle — the close() above worked,
-            # but marking the connection "gone" for the next call relied
-            # entirely on _open_serial_locked()'s own `.is_open` check
-            # happening to catch it. Declaring `global _ser` here makes
-            # the intent in the comment actually true, and skips one
-            # redundant is_open probe on the very next send.
-            logger.error("❌ UART WRITE FAILED | command=%s | error=%s", cmd, e)
+            logger.warning("Serial write error (%s): %s", command, e)
             try:
                 ser.close()
             except Exception:
                 pass
-            _ser = None
-            return False
+            global _esp32_serial
+            _esp32_serial = None
+            return f"ERROR: {e}"
+
+
+def send_uart_command(command: str) -> bool:
+    """Send one newline-delimited command to ESP32 (non-blocking)."""
+    res = send_esp32_command(command, wait_ack=False)
+    return not res.startswith("ERROR") and res != "SERIAL_DISCONNECTED"
 
 
 def close_uart():
-    global _ser, _reader_thread, _reader_stop
-
-    with _lock:
-        if _reader_stop is not None:
-            _reader_stop.set()
-
-        if _ser is not None:
+    global _esp32_serial
+    with _serial_lock:
+        if _esp32_serial is not None:
             try:
-                _ser.close()
+                _esp32_serial.close()
             except Exception:
                 pass
-
-        _ser = None
-        _reader_thread = None
-        _reader_stop = None
+            _esp32_serial = None
 
 
-VALID_DIRECTIONS = {"FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP"}
+
+def set_eye_emotion(emotion: str = "HAPPY") -> str:
+    """Sets WALL-E eye expression on face display screen."""
+    e = (emotion or "HAPPY").upper().strip()
+    return send_esp32_command(e, wait_ack=False)
 
 
-async def _move_robot(direction: str) -> str:
-    d = (direction or "").upper().strip()
+def move_wall_e_autonomous(
+    direction: str,
+    duration_ms: int = 1000,
+    speed: int = 190,
+    emotion: str = "HAPPY"
+) -> dict:
+    """
+    Moves WALL-E with AI-decided duration and speed, updates eye emotion,
+    and waits for movement to complete so AI can re-evaluate surroundings.
+    
+    direction: 'FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', or 'STOP'
+    duration_ms: 150 to 3500 ms (based on visual distance estimation)
+    speed: 130 to 255 PWM speed
+    emotion: 'HAPPY', 'SAD', 'ANGRY', 'THINK', 'IDLE'
+    """
+    direction = (direction or "STOP").upper().strip()
+    duration_ms = max(150, min(int(duration_ms), 3500))
+    speed = max(130, min(int(speed), 255))
 
-    if d not in VALID_DIRECTIONS:
-        return (
-            f"Invalid direction '{direction}'. "
-            "Use FORWARD, BACKWARD, LEFT, RIGHT, STOP."
-        )
+    # 1. Set emotional eye state first (non-blocking)
+    if emotion:
+        send_esp32_command(emotion.upper().strip(), wait_ack=False)
 
-    ok = await asyncio.to_thread(send_uart_command, d)
+    # 2. Send formatted packet DIRECTION:DURATION:SPEED to ESP32
+    if direction == "STOP":
+        ack = send_esp32_command("STOP", wait_ack=True)
+        return {"status": "stopped", "esp32_ack": ack}
 
-    if not ok:
-        result = f"ESP32 USB UART unavailable. Could not send {d}."
-        logger.error("🛠️ TOOL RESULT | move_robot | %s", result)
-        return result
+    packet = f"{direction}:{duration_ms}:{speed}"
+    ack = send_esp32_command(packet, wait_ack=True)
+
+    # 3. Wait for physical movement to finish so camera view stabilizes
+    time.sleep((duration_ms / 1000.0) + 0.15)
+
+    return {
+        "status": "moved",
+        "executed_packet": packet,
+        "esp32_ack": ack,
+        "note": "Movement completed. Check live camera feed to see new position."
+    }
+
+
+def _move_robot(direction: str, duration_ms: int = 1000, speed: int = 190, emotion: str = "HAPPY") -> str:
+    res = move_wall_e_autonomous(direction, duration_ms, speed, emotion)
+    return str(res)
+
 
     result = "WALL-E stopped." if d == "STOP" else f"WALL-E moving {d}."
     logger.info("🛠️ TOOL RESULT | move_robot | %s", result)
@@ -354,42 +265,24 @@ async def _search_web(query: str) -> str:
 
 
 async def _remember_fact(fact: str) -> str:
-    path = os.path.join(BASE, "memory.json")
-    memories = []
-
     try:
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                memories = json.load(f)
-
-        if not isinstance(memories, list):
-            memories = []
-
-    except Exception:
-        memories = []
-
-    memories.append({
-        "fact": fact,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
-
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                memories[-50:],
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
+        from conversation_memory import load_memory, save_memory
+        mem = load_memory()
+        if "facts" not in mem or not isinstance(mem["facts"], list):
+            mem["facts"] = []
+        mem["facts"].append({
+            "fact": fact,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        save_memory(mem)
         return f"Memorized: {fact}"
-
     except Exception as e:
         return f"Failed to memorize: {e}"
 
-
 TOOL_MAP = {
-    "move_robot": _move_robot,
+    "move_robot": move_wall_e_autonomous,
+    "move_wall_e_autonomous": move_wall_e_autonomous,
+    "set_eye_emotion": set_eye_emotion,
     "get_weather": _get_weather,
     "get_time_info": _get_time_info,
     "search_web": _search_web,
